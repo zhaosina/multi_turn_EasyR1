@@ -1,27 +1,9 @@
-# Copyright 2022 The HuggingFace Team
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Core functions to implement PPO algorithms.
-The function implemented in this file should be used by trainer with different distributed strategies to
-implement PPO
-"""
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Literal, Tuple
+from typing import TYPE_CHECKING, Dict, Literal, Tuple, List
+import re
 
 import numpy as np
 import torch
@@ -45,10 +27,7 @@ class KLController(ABC):
 
 
 class AdaptiveKLController(KLController):
-    """Adaptive KL controller described in: https://arxiv.org/pdf/1909.08593.pdf
-
-    Copied from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/utils.py#L54"""
-
+    """Adaptive KL controller described in: https://arxiv.org/pdf/1909.08593.pdf"""
     def __init__(self, init_kl_coef: float, target_kl: float, horizon: float):
         self.kl_coef = init_kl_coef
         self.target = target_kl
@@ -62,10 +41,7 @@ class AdaptiveKLController(KLController):
 
 
 class FixedKLController(KLController):
-    """Fixed KL controller.
-
-    Copeid from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/utils.py#L72"""
-
+    """Fixed KL controller."""
     def __init__(self, init_kl_coef: float):
         self.kl_coef = init_kl_coef
 
@@ -77,13 +53,12 @@ class AdvantageEstimator(str, Enum):
     """
     Using an enumeration class to avoid spelling errors in adv_estimator
     """
-
     GAE = "gae"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REMAX = "remax"
     RLOO = "rloo"
-
+    MGRPO_V = "mgrpo_v"  # New estimator for multi-turn visual grounding
 
 def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
     """Adapted from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L319"""
@@ -102,6 +77,252 @@ def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
     return kl_ctrl
 
 
+def _parse_coords_from_response(resp: str) -> List[float]:
+    """
+    Parses relative coordinates from the model's response string.
+    """
+    resp = resp.replace('<|im_end|>', '').strip()
+    
+    # Pattern: CLICK <point>[[x, y]]</point>
+    m = re.search(r'CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
+    if m:
+        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
+    
+    # Pattern: actions: CLICK <point>[[x, y]]</point>
+    m = re.search(r'actions?:\s*CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
+    if m:
+        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
+    
+    # Pattern: <point>[[x, y]]</point>
+    m = re.search(r'<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
+    if m:
+        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
+    return []
+
+def _convert_and_check_hit(pred_rel: List[float], gt_bbox_xywh: List[float], img_w: int, img_h: int) -> bool:
+    """
+    Converts ground truth bbox and checks if the prediction point hits it.
+    """
+    if not pred_rel or len(pred_rel) != 2:
+        return False
+
+    # 1. Convert gt bbox from [x, y, w, h] to [x1, y1, x2, y2]
+    x, y, w, h = gt_bbox_xywh
+    gt_bbox_xyxy = [x, y, x + w, y + h]
+
+    # 2. Convert gt bbox to relative coordinates
+    x1, y1, x2, y2 = gt_bbox_xyxy
+    gt_bbox_rel = [x1 / img_w, y1 / img_h, x2 / img_w, y2 / img_h]
+
+    # 3. Check for hit
+    px_rel, py_rel = pred_rel
+    hit = (gt_bbox_rel[0] <= px_rel <= gt_bbox_rel[2] and 
+           gt_bbox_rel[1] <= py_rel <= gt_bbox_rel[3])
+    return hit
+"""
+@torch.no_grad()
+def compute_mgrpo_v_advantage(
+    decoded_responses: List[str],
+    gt_bboxes_xywh: torch.Tensor,
+    image_dims: torch.Tensor,
+    response_mask: torch.Tensor,
+    trajectory_ids: torch.Tensor,
+    turn_ids: torch.Tensor,
+    # --- Config parameters for the reward function ---
+    process_reward_bonus: float = 0.5,
+    process_reward_penalty: float = -0.2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    batch_size = response_mask.shape[0]
+    device = response_mask.device
+    
+    scalar_rewards = torch.zeros(batch_size, device=device)
+
+    trajectories = defaultdict(list)
+    for i in range(batch_size):
+        trajectories[trajectory_ids[i].item()].append(i)
+
+    for traj_id, indices in trajectories.items():
+        initial_turn_idx, final_turn_idx, max_turn = -1, -1, -1
+        for i in indices:
+            if turn_ids[i].item() == 0:
+                initial_turn_idx = i
+            if turn_ids[i].item() > max_turn:
+                max_turn = turn_ids[i].item()
+                final_turn_idx = i
+        
+        if initial_turn_idx == -1 or final_turn_idx == -1:
+            continue
+
+        gt_bbox = gt_bboxes_xywh[traj_id].tolist()
+        img_w, img_h = image_dims[traj_id].tolist()
+
+        try:
+            initial_coords = _parse_coords_from_response(decoded_responses[initial_turn_idx])
+            final_coords = _parse_coords_from_response(decoded_responses[final_turn_idx])
+
+            initial_hit = _convert_and_check_hit(initial_coords, gt_bbox, img_w, img_h)
+            final_hit = _convert_and_check_hit(final_coords, gt_bbox, img_w, img_h)
+        except Exception:
+            initial_hit, final_hit = False, False
+
+        # 1. Outcome Reward: 1.0 for a final hit, 0.0 otherwise.
+        R_outcome = 1.0 if final_hit else 0.0
+
+        # 2. Process Reward: Bonus for successful correction.
+        R_process = 0.0
+        # A successful correction is when the initial attempt fails but the final one succeeds.
+        if not initial_hit and final_hit:
+            R_process = process_reward_bonus
+        # A failed correction is when the initial attempt fails and the final one also fails.
+        elif not initial_hit and not final_hit:
+            R_process = process_reward_penalty
+        
+        R_total = R_outcome + R_process
+
+        for i in indices:
+            scalar_rewards[i] = R_total
+    
+    advantages = scalar_rewards.unsqueeze(-1) * response_mask
+    returns = advantages.clone()
+
+    return advantages, returns
+"""
+
+def _compute_distance_from_center(pred_rel: List[float], gt_bbox_xywh: List[float], img_w: int, img_h: int) -> float:
+    """
+    Computes the Euclidean distance between a predicted point and the center of the ground truth bbox.
+    All calculations are done in the relative coordinate space.
+    """
+    if not pred_rel or len(pred_rel) != 2:
+        return float('inf') # Return a large distance if prediction is invalid
+
+    # Center of the ground truth bbox in relative coordinates
+    gt_x, gt_y, gt_w, gt_h = gt_bbox_xywh
+    gt_center_x_rel = (gt_x + gt_w / 2) / img_w
+    gt_center_y_rel = (gt_y + gt_h / 2) / img_h
+    
+    pred_x_rel, pred_y_rel = pred_rel
+    
+    distance = np.sqrt((pred_x_rel - gt_center_x_rel)**2 + (pred_y_rel - gt_center_y_rel)**2)
+    return distance
+
+@torch.no_grad()
+def compute_mgrpo_v_advantage(
+    decoded_responses: List[str],
+    gt_bboxes_xywh: torch.Tensor,
+    image_dims: torch.Tensor,
+    response_mask: torch.Tensor,
+    trajectory_ids: torch.Tensor,
+    turn_ids: torch.Tensor,
+    # --- Config parameters for the reward function ---
+    w_outcome: float = 1.0,
+    w_prog: float = 0.5,
+    alpha_dist: float = 1.0,
+    beta_impr: float = 2.0,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes advantage for a multi-turn visual grounding task (MGRPO-V) with dense process rewards.
+    This function calculates rewards based on the entire trajectory, incorporating:
+    1.  Outcome Reward (R_out): Whether the final prediction was a hit.
+    2.  Process Reward (R_prog): A combination of distance decay and relative improvement.
+    The final rewards are Z-score normalized and clipped to enhance training stability.
+
+    Args:
+        decoded_responses (List[str]): Decoded text responses for the entire batch.
+        gt_bboxes_xywh (torch.Tensor): Ground truth bboxes in [x,y,w,h] format. Shape: (num_trajectories, 4).
+        image_dims (torch.Tensor): Image dimensions (width, height) for each trajectory. Shape: (num_trajectories, 2).
+        response_mask (torch.Tensor): Response mask for the batch. Shape: (batch_size, response_length).
+        trajectory_ids (torch.Tensor): Groups sequences into trajectories. Shape: (batch_size,).
+        turn_ids (torch.Tensor): The turn number for each sequence. Shape: (batch_size,).
+        w_outcome (float): Weight for the outcome reward.
+        w_prog (float): Weight for the process reward.
+        alpha_dist (float): Scaling factor for the distance decay reward.
+        beta_impr (float): Scaling factor for the improvement reward.
+        eps (float): Epsilon for stable normalization.
+
+    Returns:
+        advantages (torch.Tensor): The computed advantages.
+        returns (torch.Tensor): The returns (advantages + values). Here, they are the same.
+    """
+    batch_size = response_mask.shape[0]
+    device = response_mask.device
+    
+    scalar_rewards = torch.zeros(batch_size, device=device)
+
+    trajectories = defaultdict(list)
+    for i in range(batch_size):
+        trajectories[trajectory_ids[i].item()].append(i)
+
+    for traj_id, indices in trajectories.items():
+        initial_turn_idx, final_turn_idx, max_turn = -1, -1, -1
+        for i in indices:
+            if turn_ids[i].item() == 0:
+                initial_turn_idx = i
+            if turn_ids[i].item() > max_turn:
+                max_turn = turn_ids[i].item()
+                final_turn_idx = i
+        
+        if initial_turn_idx == -1 or final_turn_idx == -1:
+            continue
+
+        gt_bbox = gt_bboxes_xywh[traj_id].tolist()
+        img_w, img_h = image_dims[traj_id].tolist()
+
+        try:
+            initial_coords = _parse_coords_from_response(decoded_responses[initial_turn_idx])
+            final_coords = _parse_coords_from_response(decoded_responses[final_turn_idx])
+
+            initial_hit = _convert_and_check_hit(initial_coords, gt_bbox, img_w, img_h)
+            final_hit = _convert_and_check_hit(final_coords, gt_bbox, img_w, img_h)
+
+            dist_initial = _compute_distance_from_center(initial_coords, gt_bbox, img_w, img_h)
+            dist_final = _compute_distance_from_center(final_coords, gt_bbox, img_w, img_h)
+
+        except Exception:
+            initial_hit, final_hit = False, False
+            dist_initial, dist_final = float('inf'), float('inf')
+
+        # --- Compute Multi-Objective Rewards ---
+
+        # 1. Outcome Reward (R_out): 1.0 for a final hit, 0.0 otherwise.
+        R_outcome = 1.0 if final_hit else 0.0
+
+        # 2. Process Reward (R_prog): Dense reward based on progress.
+        # 2a. Distance Decay Reward: Penalizes distance from the target center.
+        r_dist_decay = -alpha_dist * dist_final
+        
+        # 2b. Improvement Reward: Rewards moving closer to the target. Only for multi-turn.
+        r_improvement = 0.0
+        if max_turn > 0 and dist_initial != float('inf'): # Check if it's a correction turn
+            r_improvement = beta_impr * (dist_initial - dist_final)
+            
+        R_prog = r_dist_decay + r_improvement
+
+        # 3. Semantic Consistency Reward (R_vlm)
+        # R_vlm = compute_vlm_score(crop(final_coords), instruction)
+        # R_total = w_outcome * R_outcome + w_prog * R_prog + w_vlm * R_vlm
+        
+        R_total = w_outcome * R_outcome + w_prog * R_prog
+
+        for i in indices:
+            scalar_rewards[i] = R_total
+    
+    # --- Reward Normalization and Shaping ---
+    # Use Z-score normalization across the entire batch to reduce variance
+    mean_reward = torch.mean(scalar_rewards)
+    std_reward = torch.std(scalar_rewards)
+    normalized_rewards = (scalar_rewards - mean_reward) / (std_reward + eps)
+    
+    # Use tanh to clip rewards to [-1, 1]
+    shaped_rewards = torch.tanh(normalized_rewards)
+    advantages = shaped_rewards.unsqueeze(-1) * response_mask
+    returns = advantages.clone()
+
+    return advantages, returns
+
+
 @torch.no_grad()
 def compute_gae_advantage_return(
     token_level_rewards: torch.Tensor,
@@ -110,27 +331,6 @@ def compute_gae_advantage_return(
     gamma: torch.Tensor,
     lam: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Adapted from https://github.com/huggingface/trl/blob/v0.16.0/trl/trainer/ppo_trainer.py#L513
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        values: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length). The token after eos tokens have mask zero.
-        gamma: `(float)`
-            discounted factor used in RL
-        lam: `(float)`
-            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     lastgaelam = 0
     advantages_reversed = []
     gen_len = token_level_rewards.shape[-1]
@@ -145,157 +345,65 @@ def compute_gae_advantage_return(
     advantages = VF.masked_whiten(advantages, response_mask)
     return advantages, returns
 
-
-# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
 @torch.no_grad()
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor, eps: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for GRPO, operating only on Outcome reward
-    (with only one scalar reward for each response).
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        index: `(torch.Tensor)`
-            shape: (bs,)
-        eps: `(float)`
-            epsilon value to avoid division by zero
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     scores = token_level_rewards.sum(dim=-1)
     id2score = defaultdict(list)
     id2mean, id2std = {}, {}
-
     bsz = scores.shape[0]
     for i in range(bsz):
         id2score[index[i]].append(scores[i])
-
     for idx in id2score:
         assert len(id2score[idx]) > 1, "GRPO needs rollout.n > 1."
         id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
         id2std[idx] = torch.std(torch.tensor(id2score[idx]))
-
     for i in range(bsz):
         scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + eps)
-
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
-
 
 @torch.no_grad()
 def compute_rloo_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        index: `(torch.Tensor)`
-            shape: (bs,)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     scores = token_level_rewards.sum(dim=-1)
-
     id2score = defaultdict(list)
     id2sum = {}
     bsz = scores.shape[0]
     for i in range(bsz):
         id2score[index[i]].append(scores[i])
-
     for idx in id2score:
         id2sum[idx] = torch.sum(torch.tensor(id2score[idx]))
-
     for i in range(bsz):
         sample_num = len(id2score[index[i]])
         assert sample_num > 1, "RLOO needs rollout.n > 1."
         baseline = (id2sum[index[i]] - scores[i]) / (sample_num - 1)
         scores[i] = scores[i] - baseline
-
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
-
 
 @torch.no_grad()
 def compute_reinforce_plus_plus_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, gamma: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for REINFORCE++.
-    This implementation is based on the paper: https://arxiv.org/abs/2501.03262
-
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     returns = torch.zeros_like(token_level_rewards)
     running_return = 0
     for t in reversed(range(token_level_rewards.shape[1])):
         running_return = token_level_rewards[:, t] + gamma * running_return
         returns[:, t] = running_return
-        # Reset after EOS
         running_return = running_return * response_mask[:, t]
-
     advantages = VF.masked_whiten(returns, response_mask)
     return advantages, returns
-
 
 @torch.no_grad()
 def compute_remax_outcome_advantage(
     token_level_rewards: torch.Tensor, reward_baselines: torch.Tensor, response_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute advantage for ReMax, operating only on Outcome reward
-    This implementation is based on the paper: https://arxiv.org/abs/2310.10505
-
-    (with only one scalar reward for each response).
-    Args:
-        token_level_rewards: `(torch.Tensor)`
-            shape: (bs, response_length)
-        reward_baselines: `(torch.Tensor)`
-            shape: (bs,)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    Returns:
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        returns: `(torch.Tensor)`
-            shape: (bs, response_length)
-
-    """
     scores = token_level_rewards.sum(dim=-1) - reward_baselines
     returns = scores.unsqueeze(-1) * response_mask
     return returns, returns
-
 
 def compute_rewards(
     token_level_scores: torch.Tensor,
@@ -306,33 +414,15 @@ def compute_rewards(
     kl = log_probs - ref_log_probs
     return token_level_scores - kl * kl_ratio
 
-
 def average_loss(
     values: torch.Tensor, mask: torch.Tensor, mode: Literal["token", "seq"], eps: float = 1e-8
 ) -> torch.Tensor:
-    """Average the policy loss.
-
-    Args:
-        values: `(torch.Tensor)`
-            shape: (bs, response_length)
-        mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        mode: `(Literal["token", "seq"])`
-            "token": average the loss in the whole batch
-            "seq": average the loss in each sequence then average the mean of the means
-        eps: `(float)`
-            epsilon value
-
-    Returns:
-        loss: `a scalar torch.Tensor`
-    """
     if mode == "token":
         return VF.masked_mean(values, mask, eps=eps)
     elif mode == "seq":
         return ((values * mask).sum(-1) / (mask.sum(-1) + eps)).mean()
     else:
         raise NotImplementedError(f"Unknown mode: {mode}.")
-
 
 def compute_policy_loss(
     old_log_probs: torch.Tensor,
@@ -344,71 +434,29 @@ def compute_policy_loss(
     clip_ratio_dual: float,
     loss_avg_mode: Literal["token", "seq"],
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compute the clipped policy objective and related metrics for PPO.
-
-    Adapted from https://github.com/huggingface/trl/blob/v0.15.0/trl/trainer/ppo_trainer.py#L568
-
-    Args:
-        old_log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        log_prob: `(torch.Tensor)`
-            shape: (bs, response_length)
-        advantages: `(torch.Tensor)`
-            shape: (bs, response_length)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        clip_ratio_low: (float)
-            The lower clip range used in PPO. See https://arxiv.org/abs/1707.06347
-        clip_ratio_high: (float)
-            The higher clip range used in DAPO. See https://arxiv.org/pdf/2503.14476
-        clip_ratio_dual: (float)
-            The dual clip range used in Dual-clip PPO. See https://arxiv.org/pdf/1912.09729
-        loss_avg_mode: (Literal["token", "seq"])
-            "token": average the loss in the whole batch
-            "seq": average the loss in each sequence then average the mean of the means
-
-    Returns:
-        pg_loss: `a scalar torch.Tensor`
-            policy gradient loss computed via PPO
-        pg_clipfrac_higher: (float)
-            a float number indicating the fraction of policy gradient loss being clipped to a higher value
-        pg_clipfrac_lower: (float)
-            a float number indicating the fraction of policy gradient loss being clipped to a lower value
-        ppo_kl: (float)
-            a float number indicating the mean KL divergence between the old policy and the new policy
-        entropy_loss: (float)
-            a float number indicating the mean entropy loss
-
-    """
     negative_approx_kl = log_probs - old_log_probs
-    # clamp negative_approx_kl to avoid nan kld
     negative_approx_kl = torch.clamp(negative_approx_kl, -20.0, 20.0)
     ratio = torch.exp(negative_approx_kl)
-    # clamp the ratio before exp to avoid nan grad
-    # see: https://github.com/pytorch/pytorch/issues/10729
     clipped_ratio = torch.exp(
         torch.clamp(negative_approx_kl, np.log(1.0 - clip_ratio_low), np.log(1.0 + clip_ratio_high))
     )
 
-    # pg metrics
     metrics = {"ppo_kl": -negative_approx_kl}
-    # use negative log probs as an estimator of entropy loss
     metrics["entropy_loss"] = average_loss(-log_probs, response_mask, mode=loss_avg_mode)
 
-    pg_loss = -advantages * ratio  # -ratio * A
-    pg_loss2 = -advantages * clipped_ratio  # -clip(ratio, 1-clip_low, 1+clip_high) * A
-    pg_loss3 = -advantages * clip_ratio_dual  # -clip_dual * A
+    pg_loss = -advantages * ratio
+    pg_loss2 = -advantages * clipped_ratio
+    pg_loss3 = -advantages * clip_ratio_dual
 
-    clipped_pg_loss_higher = torch.max(pg_loss, pg_loss2)  # clip if pg_loss < pg_loss2
+    clipped_pg_loss_higher = torch.max(pg_loss, pg_loss2)
     metrics["pg_clipfrac_higher"] = (pg_loss < pg_loss2).float()
-    clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)  # clip if pg_loss > pg_loss3 and adv < 0
+    clipped_pg_loss_lower = torch.min(clipped_pg_loss_higher, pg_loss3)
     final_pg_loss = torch.where(advantages < 0, clipped_pg_loss_lower, clipped_pg_loss_higher)
     metrics["pg_clipfrac_lower"] = (clipped_pg_loss_higher > pg_loss3).float() * (advantages < 0).float()
 
     final_pg_loss = average_loss(final_pg_loss, response_mask, mode=loss_avg_mode)
     metrics = {k: VF.masked_mean(v, response_mask).detach().item() for k, v in metrics.items()}
     return final_pg_loss, metrics
-
 
 def compute_value_loss(
     vpreds: torch.Tensor,
@@ -418,78 +466,30 @@ def compute_value_loss(
     cliprange_value: float,
     loss_avg_mode: Literal["token", "seq"],
 ) -> Tuple[torch.Tensor, float]:
-    """Compute the value loss.
-
-    Adapted from https://github.com/huggingface/trl/blob/v0.15.0/trl/trainer/ppo_trainer.py#L556
-
-    Args:
-        vpreds (`torch.FloatTensor`):
-            Predicted values of the value head, shape (`batch_size`, `response_length`)
-        returns: (`torch.FloatTensor`):
-            Ground truth returns, shape (`batch_size`, `response_length`)
-        values (`torch.FloatTensor`):
-            Old values of value head, shape (`batch_size`, `response_length`)
-        response_mask: `(torch.Tensor)`
-            shape: (bs, response_length)
-        cliprange_value: (float)
-            The clip range for value net used in PPO. See https://arxiv.org/abs/1707.06347
-        loss_avg_mode: (Literal["token", "seq"])
-            "token": average the loss in the whole batch
-            "seq": average the loss in each sequence then average the mean of the means
-
-    Returns:
-        vf_loss: a scalar (`torch.FloatTensor`):
-            value function loss
-        vf_clipfrac: a float
-            The ratio of vf being clipped
-
-    """
     vpredclipped = torch.clamp(vpreds, values - cliprange_value, values + cliprange_value)
     vf_loss1 = torch.square(vpreds - returns)
     vf_loss2 = torch.square(vpredclipped - returns)
-    clipped_vf_losses = torch.max(vf_loss1, vf_loss2)  # clip if vf_loss1 < vf_loss2
+    clipped_vf_losses = torch.max(vf_loss1, vf_loss2)
     vf_loss = 0.5 * average_loss(clipped_vf_losses, response_mask, mode=loss_avg_mode)
     vf_clipfrac = VF.masked_mean((vf_loss1 < vf_loss2).float(), response_mask).detach().item()
     return vf_loss, vf_clipfrac
-
 
 def compute_kl(
     log_probs: torch.FloatTensor,
     ref_log_probs: torch.FloatTensor,
     kl_penalty: Literal["kl", "abs", "mse", "low_var_kl", "full"],
 ) -> torch.Tensor:
-    """Compute KL divergence given log_probs and ref_log_probs.
-
-    Adapted from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L1150
-
-    Args:
-        log_probs: torch.Tensor
-        ref_log_probs: torch.Tensor
-        kl_penalty: str ("kl", "abs", "mse", "low_var_kl", "full")
-
-    Returns:
-        kl_div: torch.Tensor
-
-    """
     log_probs, ref_log_probs = log_probs.float(), ref_log_probs.float()
     if kl_penalty == "kl":
         return log_probs - ref_log_probs
-
     if kl_penalty == "abs":
         return (log_probs - ref_log_probs).abs()
-
     if kl_penalty == "mse":
         return 0.5 * (log_probs - ref_log_probs).square()
-
-    # J. Schulman. Approximating kl divergence, 2020.
-    # URL http://joschu.net/blog/kl-approx.html
     if kl_penalty == "low_var_kl":
-        # For numerical stability
         kl = (ref_log_probs - log_probs).clamp(-20.0, 20.0)
         kld = (kl.exp() - kl - 1).contiguous()
         return torch.clamp(kld, min=-10.0, max=10.0)
-
     if kl_penalty == "full":
         return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
-
     raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")

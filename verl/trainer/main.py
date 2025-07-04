@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+# run_mgrpo_v_training.py
 import json
-
 import ray
 from omegaconf import OmegaConf
 
@@ -22,20 +21,25 @@ from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
 from .config import PPOConfig
+
+# 导入数据加载函数
 from .data_loader import create_dataloader
+from .data_loader import create_mgrpo_v_dataloader
+
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
 
-# please make sure main_task is not scheduled on head
 @ray.remote(num_cpus=1)
 class Runner:
     """A runner for RL training."""
 
     def run(self, config: PPOConfig):
-        # print config
+        # 打印配置
+        print("--- Training Configuration ---")
         print(json.dumps(config.to_dict(), indent=2))
+        print("------------------------------------")
 
-        # instantiate tokenizer
+        # 加载 tokenizer 和 processor
         tokenizer = get_tokenizer(
             config.worker.actor.model.model_path,
             override_chat_template=config.data.override_chat_template,
@@ -49,35 +53,61 @@ class Runner:
             use_fast=True,
         )
 
-        # define worker classes
+        # WorkerGroup 类和角色映射
         ray_worker_group_cls = RayWorkerGroup
         role_worker_mapping = {
             Role.ActorRolloutRef: ray.remote(FSDPWorker),
-            Role.Critic: ray.remote(FSDPWorker),
+            Role.Critic:         ray.remote(FSDPWorker),
         }
+
+        # 资源池配置
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         mapping = {
             Role.ActorRolloutRef: global_pool_id,
-            Role.Critic: global_pool_id,
+            Role.Critic:          global_pool_id,
         }
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=mapping,
+        )
 
-        if config.worker.reward.reward_type == "sequential":
-            RewardManager = SequentialFunctionRewardManager
-        elif config.worker.reward.reward_type == "batch":
-            RewardManager = BatchFunctionRewardManager
+        # 根据 adv_estimator 决定是否创建外部 RewardManager
+        reward_fn = None
+        val_reward_fn = None
+        if config.algorithm.adv_estimator != "mgrpo_v":
+            print(f"Initializing external reward manager for estimator: '{config.algorithm.adv_estimator}'")
+            if config.worker.reward.reward_type == "sequential":
+                RewardManager = SequentialFunctionRewardManager
+            elif config.worker.reward.reward_type == "batch":
+                RewardManager = BatchFunctionRewardManager
+            else:
+                raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
+            RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus)
+            reward_fn     = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+            val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         else:
-            raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
+            print("Algorithm is 'mgrpo_v'. Skipping external reward manager initialization.")
 
-        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus)
-        reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
-        val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+        # =================================================================
+        # 根据算法类型选择正确的数据加载函数
+        # =================================================================
+        if config.algorithm.adv_estimator == "mgrpo_v":
+            print("Creating MGRPO-V dataloaders using 'create_mgrpo_v_dataloader'...")
+            train_dataloader, val_dataloader = create_mgrpo_v_dataloader(
+                config.data, tokenizer, processor
+            )
+        else:
+            print("Creating standard dataloaders using 'create_dataloader'...")
+            train_dataloader, val_dataloader = create_dataloader(
+                config.data, tokenizer, processor
+            )
+        print("Dataloaders created successfully.")
+        # =================================================================
 
-        train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
-
+        # 初始化并运行 Trainer
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -95,20 +125,24 @@ class Runner:
 
 
 def main():
-    cli_args = OmegaConf.from_cli()
+    # 从 CLI 和配置文件加载 PPOConfig
+    cli_args       = OmegaConf.from_cli()
     default_config = OmegaConf.structured(PPOConfig())
 
     if hasattr(cli_args, "config"):
-        config_path = cli_args.pop("config", None)
-        file_config = OmegaConf.load(config_path)
-        default_config = OmegaConf.merge(default_config, file_config)
+        path = cli_args.pop("config")
+        print(f"Loading configuration from: {path}")
+        file_conf = OmegaConf.load(path)
+        default_config = OmegaConf.merge(default_config, file_conf)
 
     ppo_config = OmegaConf.merge(default_config, cli_args)
     ppo_config: PPOConfig = OmegaConf.to_object(ppo_config)
     ppo_config.deep_post_init()
 
+    # 初始化 Ray
     if not ray.is_initialized():
-        runtime_env = {
+        print("Initializing Ray...")
+        envs = {
             "env_vars": {
                 "TOKENIZERS_PARALLELISM": "true",
                 "NCCL_DEBUG": "WARN",
@@ -118,10 +152,14 @@ def main():
                 "PYTHONUNBUFFERED": "1",
             }
         }
-        ray.init(runtime_env=runtime_env)
+        ray.init(runtime_env=envs)
+        print("Ray initialized.")
 
+    # 启动远程 Runner
     runner = Runner.remote()
+    print("Starting the training runner...")
     ray.get(runner.run.remote(ppo_config))
+    print("Training finished.")
 
 
 if __name__ == "__main__":

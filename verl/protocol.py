@@ -597,11 +597,27 @@ class DataProto:
 
     def reorder(self, indices: torch.Tensor) -> None:
         """
-        Note that this operation is in-place
+        Reorders the DataProto in-place using the provided indices.
+        This version handles NumPy object arrays safely.
         """
-        indices_np = indices.detach().numpy()
-        self.batch = self.batch[indices]
-        self.non_tensor_batch = {key: value[indices_np] for key, value in self.non_tensor_batch.items()}
+        indices_np = indices.detach().cpu().numpy()
+        
+        # Reorder the tensor part (TensorDict handles this correctly)
+        if self.batch is not None:
+            self.batch = self.batch[indices]
+
+        # Reorder the non-tensor part safely
+        new_non_tensor_batch = {}
+        for key, value in self.non_tensor_batch.items():
+            # Standard indexing for regular numpy arrays
+            if value.dtype != np.dtype('object'):
+                new_non_tensor_batch[key] = value[indices_np]
+            else:
+                # Safe reordering for object arrays using list comprehension
+                reordered_list = [value[i] for i in indices_np]
+                new_non_tensor_batch[key] = np.array(reordered_list, dtype=object)
+        
+        self.non_tensor_batch = new_non_tensor_batch
 
     def repeat(self, repeat_times: int, interleave: bool = True) -> "DataProto":
         """

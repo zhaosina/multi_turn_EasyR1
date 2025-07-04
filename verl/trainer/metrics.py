@@ -12,19 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
 
 from ..protocol import DataProto
-
+from ..utils.py_functional import convert_dict_to_str
 
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     return {key: np.mean(value) for key, value in metrics.items()}
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str, Any]:
+    """Compute metrics related to the data in the batch."""
+    # This function is now updated to compute a more comprehensive set of metrics.
+    
+    # Check for the existence of keys before using them to maintain compatibility
+    if "token_level_scores" not in batch.batch or "token_level_rewards" not in batch.batch:
+        # Fallback for MGRPO-V or other flows that don't generate these scores
+        metrics = {}
+        if "advantages" in batch.batch:
+            advantages = batch.batch["advantages"]
+            metrics["critic/advantages_mean"] = advantages.mean().item()
+        if use_critic and "returns" in batch.batch:
+            returns = batch.batch["returns"]
+            metrics["critic/returns_mean"] = returns.mean().item()
+        return metrics
+
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
@@ -33,8 +49,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str
 
     max_response_length = batch.batch["responses"].size(-1)
 
-    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
-    response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
+    # Ensure attention_mask has the expected shape
+    if batch.batch["attention_mask"].dim() < 2 or batch.batch["attention_mask"].shape[1] < max_response_length:
+         # Handle cases where attention_mask might not be as expected
+        prompt_mask = torch.zeros_like(sequence_score) # Placeholder
+        response_mask = torch.ones_like(sequence_reward) # Assume all response tokens are valid if mask is malformed
+    else:
+        prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
+        response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
 
     max_prompt_length = prompt_mask.size(-1)
     prompt_length = prompt_mask.sum(-1).float()
@@ -95,6 +117,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
+    # This function remains unchanged, but is included for completeness
+    if "response_mask" not in batch.batch or "global_token_num" not in batch.meta_info:
+        return {} # Not enough info to compute timing
+
     num_response_tokens = torch.sum(batch.batch["response_mask"]).item()
     num_overall_tokens = sum(batch.meta_info["global_token_num"])
     num_tokens_of_section = {

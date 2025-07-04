@@ -18,7 +18,7 @@ Implement Actor
 import os
 from collections import defaultdict
 from typing import Any, Dict, Optional
-
+import numpy as np
 import torch
 from einops import rearrange
 from ray.experimental.tqdm_ray import tqdm
@@ -212,16 +212,14 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs = torch.concat(log_probs_lst, dim=0)
         return log_probs
 
+
     def update_policy(self, data: DataProto) -> Dict[str, Any]:
         self.actor_module.train()
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
-        select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+        temperature = data.meta_info["temperature"]
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "ref_log_probs", "advantages"]
         non_tensor_select_keys = ["multi_modal_inputs"]
 
-        # Split to make minibatch iterator for updating the actor
-        # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
 
         metrics = defaultdict(list)
@@ -239,16 +237,26 @@ class DataParallelPPOActor(BasePPOActor):
 
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+                    
+                    # --- Core Calculation ---
+                    # log_probs has a sequence length of (L_micro - 1)
+                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+                    
+                    # --- Data Alignment (The Final Key Fix) ---
+                    # Use the sequence length of the just-computed log_probs as the ground truth for slicing.
+                    log_probs_len = log_probs.shape[1]
+
+                    # Slice all other tensors to match this dynamic length.
+                    old_log_probs = model_inputs["old_log_probs"][:, :log_probs_len]
+                    advantages = model_inputs["advantages"][:, :log_probs_len]
+                    
                     responses = model_inputs["responses"]
                     response_length = responses.size(1)
                     attention_mask = model_inputs["attention_mask"]
-                    response_mask = attention_mask[:, -response_length:]
-                    old_log_probs = model_inputs["old_log_probs"]
-                    advantages = model_inputs["advantages"]
+                    full_response_mask = attention_mask[:, -response_length:]
+                    response_mask = full_response_mask[:, :log_probs_len]
 
-                    # all return: (bsz, response_length)
-                    log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
-
+                    # --- Loss Calculation ---
                     pg_loss, pg_metrics = compute_policy_loss(
                         old_log_probs=old_log_probs,
                         log_probs=log_probs,
@@ -259,9 +267,9 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_dual=self.config.clip_ratio_dual,
                         loss_avg_mode=self.config.loss_avg_mode,
                     )
+                    
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
-                        ref_log_probs = model_inputs["ref_log_probs"]
-                        # compute kl loss
+                        ref_log_probs = model_inputs["ref_log_probs"][:, :log_probs_len]
                         kld = compute_kl(
                             log_probs=log_probs,
                             ref_log_probs=ref_log_probs,
@@ -269,12 +277,13 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
                         pg_loss = pg_loss + kl_loss * self.config.kl_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_coef
+                        metrics["actor/kl_loss"].append(kl_loss.detach().item())
+                        metrics["actor/kl_coef"].append(self.config.kl_coef)
 
                     loss = pg_loss / gradient_accumulation
                     loss.backward()
 
+                    # Log metrics for this micro-batch
                     batch_metrics = {
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac_higher": pg_metrics["pg_clipfrac_higher"],
@@ -285,6 +294,8 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                metrics["actor/grad_norm"].append(grad_norm.detach().item())
 
-        return metrics
+        # Average the metrics over all micro-batches
+        averaged_metrics = {k: np.mean(v) for k, v in metrics.items()}
+        return averaged_metrics

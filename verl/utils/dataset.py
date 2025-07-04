@@ -97,7 +97,7 @@ class RLHFDataset(Dataset):
         processor: Optional[ProcessorMixin],
         prompt_key: str = "prompt",
         answer_key: str = "answer",
-        image_key: str = "images",
+        image_key: str = "image",
         video_key: str = "videos",
         image_dir: Optional[str] = None,
         video_fps: float = 2.0,

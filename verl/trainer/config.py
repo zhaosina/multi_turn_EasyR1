@@ -14,7 +14,6 @@
 """
 PPO config
 """
-
 import os
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Optional, Tuple
@@ -27,8 +26,11 @@ def recursive_post_init(dataclass_obj):
         dataclass_obj.post_init()
 
     for attr in fields(dataclass_obj):
-        if is_dataclass(getattr(dataclass_obj, attr.name)):
-            recursive_post_init(getattr(dataclass_obj, attr.name))
+        # Check if the attribute exists before getting it
+        if hasattr(dataclass_obj, attr.name):
+            attr_value = getattr(dataclass_obj, attr.name)
+            if is_dataclass(attr_value):
+                recursive_post_init(attr_value)
 
 
 @dataclass
@@ -37,7 +39,8 @@ class DataConfig:
     val_files: str = ""
     prompt_key: str = "prompt"
     answer_key: str = "answer"
-    image_key: str = "images"
+    # --- MODIFIED: Changed default key to match preprocessed data ---
+    image_key: str = "image" 
     video_key: str = "videos"
     image_dir: Optional[str] = None
     video_fps: float = 2.0
@@ -54,6 +57,12 @@ class DataConfig:
     max_pixels: Optional[int] = 4194304
     filter_overlong_prompts: bool = True
     filter_overlong_prompts_workers: int = 16
+    dataloader_num_workers: int = 8
+
+    # --- ADDED: New fields required for MGRPO-V Dataloader ---
+    gt_bbox_key: str = "ground_truth_bbox"
+    traj_id_key: str = "trajectory_id"
+    turn_id_key: str = "turn_id"
 
     def post_init(self):
         if self.image_dir is not None:
@@ -70,7 +79,6 @@ class DataConfig:
                 print(f"Format prompt file {self.format_prompt} not found.")
                 self.format_prompt = None
 
-
 @dataclass
 class AlgorithmConfig:
     gamma: float = 1.0
@@ -78,7 +86,7 @@ class AlgorithmConfig:
     lam: float = 1.0
     """lambda value for ppo gae advantage estimator"""
     adv_estimator: str = "grpo"
-    """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`"""
+    """advantage estimator, support `gae`, `grpo`, `reinforce_plus_plus`, `remax`, `rloo`, `mgrpo_v`"""
     disable_kl: bool = False
     """disable reference model"""
     use_kl_loss: bool = False
@@ -101,7 +109,11 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
-
+    w_outcome: float = 1.0
+    """weight for outcome reward in MGRPO-V"""
+    w_prog: float = 0.5
+    """weight for process reward in MGRPO-V"""
+    # -----------------------------------------
 
 @dataclass
 class TrainerConfig:

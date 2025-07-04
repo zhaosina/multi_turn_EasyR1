@@ -1,9 +1,9 @@
 data:
   train_files: hiyouga/math12k@train
   val_files: hiyouga/math12k@test
-  prompt_key: problem
+  prompt_key: prompt
   answer_key: answer
-  image_key: images
+  image_key: image
   video_key: videos
   image_dir: null
   video_fps: 2.0
@@ -21,12 +21,16 @@ data:
   filter_overlong_prompts: true
 
 algorithm:
-  adv_estimator: grpo
+  adv_estimator: mgrpo_v
+  w_outcome: 1.0 
+  w_prog: 0.5    
+ 
+  
   disable_kl: false
   use_kl_loss: true
   kl_penalty: low_var_kl
   kl_coef: 1.0e-2
-  online_filtering: false  # dapo filter groups
+  online_filtering: false 
   filter_key: overall
   filter_low: 0.01
   filter_high: 0.99

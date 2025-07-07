@@ -47,9 +47,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 import json, logging, os
 from functools import partial
 from typing import Any, Dict, List, Tuple
-
-# mgrpo_v_dataloader.py
-
+import torchvision.transforms.v2 as T
 import torch
 import os
 import json
@@ -62,29 +60,21 @@ from functools import partial
 from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-# Assuming DataConfig is in this path, adjust if necessary
 from .config import DataConfig
 
-# --- New MGRPO-V Dataset Class ---
 
 class MGRPODataset(Dataset):
-    """
-    A specialized dataset for MGRPO-V training.
-    It only loads raw data; all processing is now handled by the collate_fn.
-    """
     def __init__(
         self,
         data_path: str,
         image_dir: str,
-        # Add image_size to ensure consistent shapes for stacking
         image_size: tuple = (448, 448),
         prompt_key: str = "prompt",
         image_key: str = "image",
         gt_bbox_key: str = "ground_truth_bbox",
         traj_id_key: str = "trajectory_id",
         turn_id_key: str = "turn_id",
-        **kwargs, # Absorb other arguments
+        **kwargs, 
     ):
         self.data_path = data_path
         self.image_dir = image_dir
@@ -147,7 +137,6 @@ class MGRPODataset(Dataset):
             "turn_ids": torch.tensor(turn_id, dtype=torch.long),
         }
 
-# --- FINAL ROBUST Collate Function (Based on your implementation) ---
 
 def mgrpo_v_collate_fn(
     batch: List[Dict[str, Any]],
@@ -156,16 +145,18 @@ def mgrpo_v_collate_fn(
     tokenizer: PreTrainedTokenizer,
 ) -> Dict[str, Any]:
     """
-    Collates data for MGRPO-V, ensuring `position_ids` is created and
-    that all returned values are tensors or numpy arrays compatible with DataProto.
+    [最终版] 采用循环方式逐个处理样本，并集成Tensor方案以支持迭代纠错。
     """
-    batch = [b for b in batch if b]
+    # 安全检查：过滤掉 prompt 为空或无效的样本
+    batch = [b for b in batch if b and b.get("prompt")]
     if not batch:
         return {}
+    batch_size = len(batch)
 
-    # 1. Process each sample individually
+    # 1. 在循环中逐个处理样本 (遵循您的要求)
     proc_outs = []
     for b in batch:
+        # 注意：此处不进行 padding，padding 在后续步骤中对整个批次进行
         proc_out = processor(
             text=[b["prompt"]],
             images=[b["image"]],
@@ -175,7 +166,7 @@ def mgrpo_v_collate_fn(
         )
         proc_outs.append(proc_out)
 
-    # 2. Pad text-related tensors
+    # 2. 手动对文本进行批处理和填充
     ids_list  = [o.input_ids[0] for o in proc_outs]
     mask_list = [o.attention_mask[0] for o in proc_outs]
     text_padded = tokenizer.pad(
@@ -185,50 +176,49 @@ def mgrpo_v_collate_fn(
     )
     B, L = text_padded["input_ids"].shape
 
-    # 3. Create position_ids
-    position_ids = torch.arange(L, dtype=torch.long, device=text_padded["input_ids"].device)
-    position_ids = position_ids.unsqueeze(0).repeat(B, 1)
+    # 3. 手动对图像特征进行批处理和重塑
+    pv_list = [o["pixel_values"] for o in proc_outs]
+    pixel_values_flat = torch.cat(pv_list, dim=0)
+    
+    # [必要修复] 重塑 pixel_values 以匹配正确的批处理形状 [B, Num_Patches, Dim]
+    if pixel_values_flat.dim() == 2 and pixel_values_flat.shape[0] != batch_size:
+        assert pixel_values_flat.shape[0] % batch_size == 0
+        pixel_values = pixel_values_flat.view(batch_size, -1, pixel_values_flat.shape[-1])
+    else:
+        pixel_values = pixel_values_flat
 
-    # 4. Stack image-related tensors
-    pv_list, thw_list = [], []
-    for o in proc_outs:
-        pv = o["pixel_values"]
-        if pv.ndim == 2:
-            pv = pv.unsqueeze(0)
-        pv_list.append(pv)
-        if "image_grid_thw" in o:
-            g = o["image_grid_thw"]
-            if g.ndim == 1:
-                g = g.unsqueeze(0)
-            thw_list.append(g)
-            
-    pixel_values = torch.cat(pv_list, dim=0)
-    if thw_list:
-        image_grid_thw = torch.cat(thw_list, dim=0)
+    # 4. [Tensor方案核心] 将原始图像转换为uint8张量
+    pil_images = [b["image"] for b in batch]
+    original_pixel_values = torch.stack(
+        [T.PILToTensor()(img) for img in pil_images]
+    ).permute(0, 2, 3, 1) # 从 [B,C,H,W] 转为 [B,H,W,C]
 
-    # 5. Create raw_prompt_ids as a NumPy object array to be compatible with DataProto
+    # 5. 创建其他Tensors
+    position_ids = torch.arange(L, dtype=torch.long, device=text_padded["input_ids"].device).unsqueeze(0).repeat(B, 1)
     raw_prompt_ids = [tokenizer.encode(b["prompt"], add_special_tokens=False) for b in batch]
     
-    # Assemble the final dictionary
+    # 6. 组装最终字典
     out = {
         # Tensors
-        "input_ids":       text_padded["input_ids"],
-        "attention_mask":  text_padded["attention_mask"],
-        "position_ids":    position_ids,
-        "pixel_values":    pixel_values,
-        "gt_bboxes_xywh":  torch.stack([b["gt_bboxes_xywh"] for b in batch]),
-        "image_dims":      torch.stack([b["image_dims"]     for b in batch]),
-        "trajectory_ids":  torch.stack([b["trajectory_ids"] for b in batch]),
-        "turn_ids":        torch.stack([b["turn_ids"]       for b in batch]),
-        # Non-Tensor (must be a numpy array for DataProto)
-        "raw_prompt_ids":  np.array(raw_prompt_ids, dtype=object),
+        "input_ids":             text_padded["input_ids"],
+        "attention_mask":        text_padded["attention_mask"],
+        "position_ids":          position_ids,
+        "pixel_values":          pixel_values,
+        "original_pixel_values": original_pixel_values, # <-- 使用Tensor存储原始图像
+        "gt_bboxes_xywh":        torch.stack([b["gt_bboxes_xywh"] for b in batch]),
+        "image_dims":            torch.stack([b["image_dims"] for b in batch]),
+        "trajectory_ids":        torch.stack([b["trajectory_ids"] for b in batch]),
+        "turn_ids":              torch.stack([b["turn_ids"] for b in batch]),
+        # Non-Tensor
+        "original_prompts":      np.array([b["prompt"] for b in batch], dtype=object),
+        "raw_prompt_ids":        np.array(raw_prompt_ids, dtype=object),
     }
+
+    thw_list = [o.get("image_grid_thw") for o in proc_outs if o.get("image_grid_thw") is not None]
     if thw_list:
-        out["image_grid_thw"] = image_grid_thw
+        out["image_grid_thw"] = torch.cat(thw_list, dim=0)
 
     return out
-
-# --- Dataloader Creation Function (Updated) ---
 
 def create_mgrpo_v_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> tuple:
     """
@@ -286,7 +276,6 @@ def create_mgrpo_v_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer
     
     return train_dataloader, val_dataloader
 
-    
 def create_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> None:
     train_dataset = RLHFDataset(
         data_path=config.train_files,

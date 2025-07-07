@@ -24,7 +24,7 @@ from einops import rearrange
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
+import math
 from ...protocol import DataProto
 from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
 from ...utils import torch_functional as VF
@@ -171,46 +171,32 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.actor_optimizer.zero_grad()
         return grad_norm
-
-    @torch.no_grad()
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
-        """Compute the log probability of the responses given input_ids, attention_mask and position_ids
-
-        Args:
-            data (DataProto): a DataProto containing keys
-
-                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
-                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
-
-                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
-
-        Returns:
-            torch.Tensor: the log_prob tensor
-        """
         self.actor_module.eval()
 
         temperature = data.meta_info["temperature"]
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
         non_tensor_select_keys = ["multi_modal_inputs"]
 
-        micro_batches = data.select(select_keys, non_tensor_select_keys).split(
-            self.config.micro_batch_size_per_device_for_experience
-        )
-        log_probs_lst = []
+        full = data.select(select_keys, non_tensor_select_keys)
+        
+        # --- 关键：确定安全的 chunk_size ---
+        total = len(full)
+        target = self.config.micro_batch_size_per_device_for_experience
+        chunk_size = target if total % target == 0 else math.gcd(total, target)
+        chunk_size = chunk_size or total     # gcd 可能为 0
+
+        micro_batches = full.split(chunk_size)
         if self.rank == 0:
             micro_batches = tqdm(micro_batches, desc="Compute log probs", position=1)
 
-        for micro_batch in micro_batches:
-            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
-            log_probs_lst.append(log_probs)
+        log_probs_lst = []
+        for micro in micro_batches:
+            model_inputs = {**micro.batch, **micro.non_tensor_batch}
+            lp = self._forward_micro_batch(model_inputs, temperature=temperature)
+            log_probs_lst.append(lp)
 
-        log_probs = torch.concat(log_probs_lst, dim=0)
-        return log_probs
+        return torch.cat(log_probs_lst, dim=0)
 
 
     def update_policy(self, data: DataProto) -> Dict[str, Any]:
@@ -220,8 +206,12 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "ref_log_probs", "advantages"]
         non_tensor_select_keys = ["multi_modal_inputs"]
 
-        mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
-
+        full = data.select(select_keys, non_tensor_select_keys)
+        total = len(full)
+        target = self.config.global_batch_size_per_device
+        chunk_size = target if total % target == 0 else math.gcd(total, target)
+        chunk_size = chunk_size or total
+        mini_batches = full.split(chunk_size)
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
             if self.rank == 0:

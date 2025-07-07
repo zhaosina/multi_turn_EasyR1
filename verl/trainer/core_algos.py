@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from ..utils import torch_functional as VF
-
+import logging
 
 if TYPE_CHECKING:
     from .config import AlgorithmConfig
@@ -76,248 +76,198 @@ def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
 
     return kl_ctrl
 
+def _parse_absolute_coords_from_response(resp: str, img_w: int, img_h: int) -> List[int]:
 
-def _parse_coords_from_response(resp: str) -> List[float]:
-    """
-    Parses relative coordinates from the model's response string.
-    """
     resp = resp.replace('<|im_end|>', '').strip()
     
-    # Pattern: CLICK <point>[[x, y]]</point>
+    # 优先匹配最完整的格式
     m = re.search(r'CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
-    if m:
-        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
+    if m: return [int(m.group(1)), int(m.group(2))]
     
-    # Pattern: actions: CLICK <point>[[x, y]]</point>
     m = re.search(r'actions?:\s*CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
-    if m:
-        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
+    if m: return [int(m.group(1)), int(m.group(2))]
     
-    # Pattern: <point>[[x, y]]</point>
     m = re.search(r'<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
+    if m: return [int(m.group(1)), int(m.group(2))]
+    
+    m = re.search(r'<points[^>]*x1\s*=\s*[\'"]?([\d.]+)[\'"]?[^>]*y1\s*=\s*[\'"]?([\d.]+)[\'"]?', resp, flags=re.I)
+    if m: return [int(float(m.group(1))), int(float(m.group(2)))]
+
+    m = re.search(r'<point>\[(\d+\.?\d*),\s*(\d+\.?\d*)\]</point>', resp, flags=re.I)
     if m:
-        return [int(m.group(1)) / 1000.0, int(m.group(2)) / 1000.0]
-    return []
+        x, y = float(m.group(1)), float(m.group(2))
+        if x <= 1.0 and y <= 1.0: return [int(x * img_w), int(y * img_h)]
+        return [int(x), int(y)]
 
-def _convert_and_check_hit(pred_rel: List[float], gt_bbox_xywh: List[float], img_w: int, img_h: int) -> bool:
-    """
-    Converts ground truth bbox and checks if the prediction point hits it.
-    """
-    if not pred_rel or len(pred_rel) != 2:
-        return False
+    m = re.search(r'[\[\(]\s*([\d.]+)\s*,\s*([\d.]+)\s*[\]\)]', resp)
+    if m:
+        x, y = float(m.group(1)), float(m.group(2))
+        if x <= 1.0 and y <= 1.0: return [int(x * img_w), int(y * img_h)]
+        return [int(x), int(y)]
+    
+    raise ValueError("no_coord_found_in_response")
 
-    # 1. Convert gt bbox from [x, y, w, h] to [x1, y1, x2, y2]
+def _check_hit_absolute(pred_abs: List[int], gt_bbox_xywh: List[float]) -> bool:
+
+    if not pred_abs or len(pred_abs) != 2: return False
+    pred_x, pred_y = pred_abs
     x, y, w, h = gt_bbox_xywh
-    gt_bbox_xyxy = [x, y, x + w, y + h]
+    gt_x1, gt_y1, gt_x2, gt_y2 = x, y, x + w, y + h
+    return (gt_x1 <= pred_x <= gt_x2 and gt_y1 <= pred_y <= gt_y2)
 
-    # 2. Convert gt bbox to relative coordinates
-    x1, y1, x2, y2 = gt_bbox_xyxy
-    gt_bbox_rel = [x1 / img_w, y1 / img_h, x2 / img_w, y2 / img_h]
+def _compute_distance_absolute(pred_abs: List[int], gt_bbox_xywh: List[float]) -> float:
 
-    # 3. Check for hit
-    px_rel, py_rel = pred_rel
-    hit = (gt_bbox_rel[0] <= px_rel <= gt_bbox_rel[2] and 
-           gt_bbox_rel[1] <= py_rel <= gt_bbox_rel[3])
-    return hit
-"""
-@torch.no_grad()
-def compute_mgrpo_v_advantage(
-    decoded_responses: List[str],
-    gt_bboxes_xywh: torch.Tensor,
-    image_dims: torch.Tensor,
-    response_mask: torch.Tensor,
-    trajectory_ids: torch.Tensor,
-    turn_ids: torch.Tensor,
-    # --- Config parameters for the reward function ---
-    process_reward_bonus: float = 0.5,
-    process_reward_penalty: float = -0.2,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not pred_abs or len(pred_abs) != 2: return float('inf')
+    pred_x, pred_y = pred_abs
+    x, y, w, h = gt_bbox_xywh
+    gt_center_x = x + w / 2
+    gt_center_y = y + h / 2
+    return np.sqrt((pred_x - gt_center_x)**2 + (pred_y - gt_center_y)**2)
 
-    batch_size = response_mask.shape[0]
-    device = response_mask.device
-    
-    scalar_rewards = torch.zeros(batch_size, device=device)
+def _calculate_distance(point1: List[float], point2: List[float]) -> float:
+    p1 = np.array(point1)
+    p2 = np.array(point2)
+    return np.linalg.norm(p1 - p2)
 
-    trajectories = defaultdict(list)
-    for i in range(batch_size):
-        trajectories[trajectory_ids[i].item()].append(i)
 
-    for traj_id, indices in trajectories.items():
-        initial_turn_idx, final_turn_idx, max_turn = -1, -1, -1
-        for i in indices:
-            if turn_ids[i].item() == 0:
-                initial_turn_idx = i
-            if turn_ids[i].item() > max_turn:
-                max_turn = turn_ids[i].item()
-                final_turn_idx = i
-        
-        if initial_turn_idx == -1 or final_turn_idx == -1:
-            continue
-
-        gt_bbox = gt_bboxes_xywh[traj_id].tolist()
-        img_w, img_h = image_dims[traj_id].tolist()
-
-        try:
-            initial_coords = _parse_coords_from_response(decoded_responses[initial_turn_idx])
-            final_coords = _parse_coords_from_response(decoded_responses[final_turn_idx])
-
-            initial_hit = _convert_and_check_hit(initial_coords, gt_bbox, img_w, img_h)
-            final_hit = _convert_and_check_hit(final_coords, gt_bbox, img_w, img_h)
-        except Exception:
-            initial_hit, final_hit = False, False
-
-        # 1. Outcome Reward: 1.0 for a final hit, 0.0 otherwise.
-        R_outcome = 1.0 if final_hit else 0.0
-
-        # 2. Process Reward: Bonus for successful correction.
-        R_process = 0.0
-        # A successful correction is when the initial attempt fails but the final one succeeds.
-        if not initial_hit and final_hit:
-            R_process = process_reward_bonus
-        # A failed correction is when the initial attempt fails and the final one also fails.
-        elif not initial_hit and not final_hit:
-            R_process = process_reward_penalty
-        
-        R_total = R_outcome + R_process
-
-        for i in indices:
-            scalar_rewards[i] = R_total
-    
-    advantages = scalar_rewards.unsqueeze(-1) * response_mask
-    returns = advantages.clone()
-
-    return advantages, returns
-"""
-
-def _compute_distance_from_center(pred_rel: List[float], gt_bbox_xywh: List[float], img_w: int, img_h: int) -> float:
+def _score_trajectory(trajectory_coords: List[List[int]], gt_bbox_xywh: List[float], img_dims: List[int]) -> Dict[str, float]:
     """
-    Computes the Euclidean distance between a predicted point and the center of the ground truth bbox.
-    All calculations are done in the relative coordinate space.
+    对一条完整的轨迹进行评分，返回一个包含各项得分的字典。
     """
-    if not pred_rel or len(pred_rel) != 2:
-        return float('inf') # Return a large distance if prediction is invalid
+    if not trajectory_coords:
+        # 如果轨迹无效，返回一个包含惩罚分数的字典
+        return {
+            "total": -10.0,
+            "accuracy": 0.0,
+            "efficiency": 0.0,
+            "smoothness": 0.0,
+        }
 
-    # Center of the ground truth bbox in relative coordinates
     gt_x, gt_y, gt_w, gt_h = gt_bbox_xywh
-    gt_center_x_rel = (gt_x + gt_w / 2) / img_w
-    gt_center_y_rel = (gt_y + gt_h / 2) / img_h
+    target_center = [gt_x + gt_w / 2, gt_y + gt_h / 2]
     
-    pred_x_rel, pred_y_rel = pred_rel
+    # 1. 准确度得分 (Accuracy Score)
+    final_prediction = trajectory_coords[-1]
+    final_distance = _calculate_distance(final_prediction, target_center)
+    accuracy_score = np.exp(-final_distance / 50.0)
+
+    # 2. 效率得分 (Efficiency Score)
+    efficiency_score = 1.0 / len(trajectory_coords)
+
+    # 3. 平滑度得分 (Smoothness Score)
+    smoothness = 0
+    if len(trajectory_coords) > 2:
+        for i in range(2, len(trajectory_coords)):
+            step_size = _calculate_distance(trajectory_coords[i], trajectory_coords[i-1])
+            prev_step_size = _calculate_distance(trajectory_coords[i-1], trajectory_coords[i-2])
+            if step_size < prev_step_size:
+                smoothness += 1
+    smoothness_score = smoothness / max(len(trajectory_coords) - 2, 1)
+
+    # 组合最终得分
+    final_score = accuracy_score * (1 + 0.2 * efficiency_score + 0.2 * smoothness_score)
     
-    distance = np.sqrt((pred_x_rel - gt_center_x_rel)**2 + (pred_y_rel - gt_center_y_rel)**2)
-    return distance
+    return {
+        "total": final_score,
+        "accuracy": accuracy_score,
+        "efficiency": efficiency_score,
+        "smoothness": smoothness_score,
+    }
 
 @torch.no_grad()
 def compute_mgrpo_v_advantage(
-    decoded_responses: List[str],
+    decoded_responses: np.ndarray,
     gt_bboxes_xywh: torch.Tensor,
     image_dims: torch.Tensor,
     response_mask: torch.Tensor,
     trajectory_ids: torch.Tensor,
     turn_ids: torch.Tensor,
-    # --- Config parameters for the reward function ---
-    w_outcome: float = 1.0,
-    w_prog: float = 0.5,
-    alpha_dist: float = 1.0,
-    beta_impr: float = 2.0,
     eps: float = 1e-8,
+    w_outcome: float = 1.0,
+    w_prog: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Computes advantage for a multi-turn visual grounding task (MGRPO-V) with dense process rewards.
-    This function calculates rewards based on the entire trajectory, incorporating:
-    1.  Outcome Reward (R_out): Whether the final prediction was a hit.
-    2.  Process Reward (R_prog): A combination of distance decay and relative improvement.
-    The final rewards are Z-score normalized and clipped to enhance training stability.
-
-    Args:
-        decoded_responses (List[str]): Decoded text responses for the entire batch.
-        gt_bboxes_xywh (torch.Tensor): Ground truth bboxes in [x,y,w,h] format. Shape: (num_trajectories, 4).
-        image_dims (torch.Tensor): Image dimensions (width, height) for each trajectory. Shape: (num_trajectories, 2).
-        response_mask (torch.Tensor): Response mask for the batch. Shape: (batch_size, response_length).
-        trajectory_ids (torch.Tensor): Groups sequences into trajectories. Shape: (batch_size,).
-        turn_ids (torch.Tensor): The turn number for each sequence. Shape: (batch_size,).
-        w_outcome (float): Weight for the outcome reward.
-        w_prog (float): Weight for the process reward.
-        alpha_dist (float): Scaling factor for the distance decay reward.
-        beta_impr (float): Scaling factor for the improvement reward.
-        eps (float): Epsilon for stable normalization.
-
-    Returns:
-        advantages (torch.Tensor): The computed advantages.
-        returns (torch.Tensor): The returns (advantages + values). Here, they are the same.
-    """
     batch_size = response_mask.shape[0]
     device = response_mask.device
     
-    scalar_rewards = torch.zeros(batch_size, device=device)
-
-    trajectories = defaultdict(list)
+    trajectories_indices = defaultdict(list)
+    # --- 1. 按轨迹ID分组 ---
+    # 这里的 trajectory_id 是我们在预处理时为每个初始 prompt 分配的唯一ID
+    # 在 _make_batch_data 中，这个ID被乘以K并加上k，为每个生成的轨迹创建了新的唯一ID
     for i in range(batch_size):
-        trajectories[trajectory_ids[i].item()].append(i)
+        # 我们需要按初始 prompt 分组，所以用 trajectory_id // K (假设K是rollout.n)
+        trajectories_indices[trajectory_ids[i].item()].append(i)
 
-    for traj_id, indices in trajectories.items():
-        initial_turn_idx, final_turn_idx, max_turn = -1, -1, -1
-        for i in indices:
-            if turn_ids[i].item() == 0:
-                initial_turn_idx = i
-            if turn_ids[i].item() > max_turn:
-                max_turn = turn_ids[i].item()
-                final_turn_idx = i
+    advantages = torch.zeros(batch_size, device=device)
+    log_counter = 0
+    log_limit = 3  # 只打印每个批次中前3个轨迹组的详细日志
+
+    # --- 2. 为每个轨迹组计算优势 ---
+    for group_id, group_indices in trajectories_indices.items():
         
-        if initial_turn_idx == -1 or final_turn_idx == -1:
-            continue
+        should_log = log_counter < log_limit
+        if should_log:
+            logging.warning(f"\n--- [DEBUG] Processing Trajectory Group ID: {group_id} ---")
 
-        gt_bbox = gt_bboxes_xywh[traj_id].tolist()
-        img_w, img_h = image_dims[traj_id].tolist()
-
-        try:
-            initial_coords = _parse_coords_from_response(decoded_responses[initial_turn_idx])
-            final_coords = _parse_coords_from_response(decoded_responses[final_turn_idx])
-
-            initial_hit = _convert_and_check_hit(initial_coords, gt_bbox, img_w, img_h)
-            final_hit = _convert_and_check_hit(final_coords, gt_bbox, img_w, img_h)
-
-            dist_initial = _compute_distance_from_center(initial_coords, gt_bbox, img_w, img_h)
-            dist_final = _compute_distance_from_center(final_coords, gt_bbox, img_w, img_h)
-
-        except Exception:
-            initial_hit, final_hit = False, False
-            dist_initial, dist_final = float('inf'), float('inf')
-
-        # --- Compute Multi-Objective Rewards ---
-
-        # 1. Outcome Reward (R_out): 1.0 for a final hit, 0.0 otherwise.
-        R_outcome = 1.0 if final_hit else 0.0
-
-        # 2. Process Reward (R_prog): Dense reward based on progress.
-        # 2a. Distance Decay Reward: Penalizes distance from the target center.
-        r_dist_decay = -alpha_dist * dist_final
+        group_scores = []
         
-        # 2b. Improvement Reward: Rewards moving closer to the target. Only for multi-turn.
-        r_improvement = 0.0
-        if max_turn > 0 and dist_initial != float('inf'): # Check if it's a correction turn
-            r_improvement = beta_impr * (dist_initial - dist_final)
+        # --- 2a. 评分：为组内的每个轨迹计算得分 ---
+        # group_indices 现在包含一个轨迹的所有steps的索引
+        # 我们需要再次按轨迹ID细分
+        sub_trajectories = defaultdict(list)
+        for idx in group_indices:
+            sub_trajectories[trajectory_ids[idx].item()].append(idx)
+
+        for traj_id_in_group, step_indices in sub_trajectories.items():
             
-        R_prog = r_dist_decay + r_improvement
+            # 按轮次排序
+            sorted_step_indices = sorted(step_indices, key=lambda i: turn_ids[i].item())
+            
+            # 解析坐标
+            coords_list = []
+            img_w, img_h = image_dims[sorted_step_indices[0]].tolist()
+            
+            if should_log:
+                logging.warning(f"  - Trajectory {traj_id_in_group}:")
 
-        # 3. Semantic Consistency Reward (R_vlm)
-        # R_vlm = compute_vlm_score(crop(final_coords), instruction)
-        # R_total = w_outcome * R_outcome + w_prog * R_prog + w_vlm * R_vlm
+            for step_idx in sorted_step_indices:
+                resp = decoded_responses[step_idx]
+                try:
+                    coords = _parse_absolute_coords_from_response(resp, img_w, img_h)
+                    coords_list.append(coords)
+                    if should_log:
+                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: Parsed {coords} from '{resp.strip()}'")
+                except ValueError:
+                    if should_log:
+                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: Parsing FAILED for '{resp.strip()}'")
+                    coords_list = []
+                    break
+            
+            # 计算轨迹得分
+            gt_bbox = gt_bboxes_xywh[sorted_step_indices[0]].tolist()
+            score_dict = _score_trajectory(coords_list, gt_bbox, [img_w, img_h])
+            group_scores.append(score_dict["total"])
+            
+            if should_log:
+                logging.warning(f"    -> Trajectory Score: {score_dict['total']:.3f} (Acc: {score_dict['accuracy']:.2f}, Eff: {score_dict['efficiency']:.2f}, Smooth: {score_dict['smoothness']:.2f})")
+
+        # --- 2b. GRPO优势计算 ---
+        if not group_scores: continue
+        scores_tensor = torch.tensor(group_scores, device=device)
+        mean_score = scores_tensor.mean()
+        std_score = scores_tensor.std()
+        traj_advantages = (scores_tensor - mean_score) / (std_score + eps)
+
+        # --- 2c. 广播优势 ---
+        for i, traj_id_in_group in enumerate(sub_trajectories.keys()):
+            traj_advantage = traj_advantages[i]
+            advantages[trajectory_ids == traj_id_in_group] = traj_advantage
         
-        R_total = w_outcome * R_outcome + w_prog * R_prog
-
-        for i in indices:
-            scalar_rewards[i] = R_total
-    
-    # --- Reward Normalization and Shaping ---
-    # Use Z-score normalization across the entire batch to reduce variance
-    mean_reward = torch.mean(scalar_rewards)
-    std_reward = torch.std(scalar_rewards)
-    normalized_rewards = (scalar_rewards - mean_reward) / (std_reward + eps)
-    
-    # Use tanh to clip rewards to [-1, 1]
-    shaped_rewards = torch.tanh(normalized_rewards)
-    advantages = shaped_rewards.unsqueeze(-1) * response_mask
+        if should_log:
+            logging.warning(f"  - Group Advantage Stats: Mean={mean_score:.3f}, Std={std_score:.3f}")
+            logging.warning(f"--- [DEBUG] End Group ID: {group_id} ---\n")
+            log_counter += 1
+            
+    advantages = advantages.unsqueeze(-1) * response_mask
     returns = advantages.clone()
 
     return advantages, returns

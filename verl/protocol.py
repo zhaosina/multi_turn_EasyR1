@@ -22,7 +22,7 @@ import pickle
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+import logging
 import numpy as np
 import ray
 import torch
@@ -576,25 +576,46 @@ class DataProto:
         chunks = len(self) // split_size
         return self.chunk(chunks)
 
+
     @staticmethod
     def concat(data: List["DataProto"]) -> "DataProto":
-        """Concat a list of DataProto. The batch is concatenated among dim=0.
-        The meta_info is assumed to be identical and will use the first one.
-
-        Args:
-            data (List[DataProto]): list of DataProto
-
-        Returns:
-            DataProto: concatenated DataProto
         """
-        batch_lst = [batch.batch for batch in data]
-        new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
-        non_tensor_batch = batch_collate([d.non_tensor_batch for d in data])
-        for key, value in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(value, axis=0)
+        Concat a list of DataProto. The batch is concatenated among dim=0.
+        The meta_info is assumed to be identical and will use the first one.
+        """
+        if not data:
+            return DataProto()
 
-        return DataProto(batch=new_batch, non_tensor_batch=non_tensor_batch, meta_info=data[0].meta_info)
+        # 1. 拼接 Tensor 部分 (这部分逻辑是正确的)
+        batch_lst = [d.batch for d in data if d.batch is not None]
+        new_batch = torch.cat(batch_lst, dim=0) if batch_lst else None
+        
+        # 2. 收集所有 non-tensor 字典
+        non_tensor_batch_collated = batch_collate([d.non_tensor_batch for d in data])
+        final_non_tensor_batch = {}
 
+        # --- BEGIN FINAL FIX ---
+        # 3. 对 non-tensor 部分进行健壮的合并，而不是拼接
+        for key, list_of_arrays in non_tensor_batch_collated.items():
+            # a. 将每个数组中的所有元素提取出来，放入一个大的 Python 列表
+            all_elements = []
+            for arr in list_of_arrays:
+                # .tolist() 可以安全地处理各种形状和类型的 numpy 数组
+                all_elements.extend(arr.tolist())
+            
+            # b. 从这个包含所有元素的扁平化列表中，创建一个新的、安全的1D对象数组
+            #    这保证了结果总是一个规整的、可预测的结构。
+            final_non_tensor_batch[key] = np.array(all_elements, dtype=object)
+        # --- END FINAL FIX ---
+
+        # 4. 使用第一个非空 DataProto 的 meta_info
+        first_meta_info = next((d.meta_info for d in data if d), {})
+        
+        return DataProto(
+            batch=new_batch, 
+            non_tensor_batch=final_non_tensor_batch, # 使用新创建的、健壮的 non-tensor 字典
+            meta_info=first_meta_info
+        )
     def reorder(self, indices: torch.Tensor) -> None:
         """
         Reorders the DataProto in-place using the provided indices.

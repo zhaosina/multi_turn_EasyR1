@@ -38,6 +38,7 @@ class RolloutConfig:
     max_num_batched_tokens: int = 8192
     disable_log_stats: bool = True
     disable_tqdm: bool = False
+    max_iterations: int = 3
     val_override_config: Dict[str, Any] = field(default_factory=dict)
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)

@@ -9,24 +9,18 @@ import logging
 
 def get_system_prompt():
     """获取系统提示"""
-    return """You are now operating in Executable Language Grounding mode. Your goal is to help users accomplish tasks by suggesting executable actions that best fit their needs. Your skill set includes both basic and custom actions:
-
-1. Basic Actions
-Basic Action 1: CLICK 
+    return """You are now operating in Executable Language Grounding mode. Your goal is to help users accomplish tasks by suggesting executable actions' coordinates in specific format that best fit their needs:
+CLICK 
     - purpose: Click at the specified position.
     - format: CLICK <point>[[x-axis, y-axis]]</point>
     - example usage: CLICK <point>[[101, 872]]</point>
 
-In most cases, task instructions are high-level and abstract. Carefully read the instruction and action history, then perform reasoning to determine the most appropriate next action. Ensure you strictly generate two sections: Thoughts and Actions.
-Thoughts: Clearly outline your reasoning process for current step.
-Actions: Specify the actual actions you will take based on your reasoning. You should follow action format above when generating.
-
-Your current task instruction, action history, and associated screenshot are as follows:
+Your current task instruction, action grounding history, and associated screenshot are as follows:
 Screenshot: """
 
 def get_task_prompts():
     """获取任务提示模板"""
-    # 对于在线RL，我们主要关注初始提示，因为后续的纠正行为是模型需要学习的
+    # 对于在线RL，我们主要关注初始提示，后续的纠正行为是模型需要学习的
     return ["Task instruction: {}\nHistory: null"]
 
 # --- 主处理函数 ---
@@ -80,9 +74,6 @@ def create_grpo_dataset_with_system_prompt(
         task_prompt = task_prompt_template.format(instruction)
         full_prompt = f"{system_prompt}\n\n{task_prompt}"
 
-        # 2. 组织成我们 MGRPO-V Dataloader 所需的格式
-        # 注意：我们仍然需要 trajectory_id 和 turn_id，即使我们只处理初始回合。
-        # 这是因为奖励函数 compute_mgrpo_v_advantage 的设计是基于轨迹的。
         processed_data.append({
             "trajectory_id": i,
             "turn_id": 0,

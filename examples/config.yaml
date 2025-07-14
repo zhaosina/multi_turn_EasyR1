@@ -63,6 +63,7 @@ worker:
 
   rollout:
     n: 5
+    do_sample: true
     temperature: 1.0
     top_p: 0.99
     limit_images: 0
@@ -78,7 +79,7 @@ worker:
   ref:
     fsdp:
       enable_full_shard: true
-      enable_cpu_offload: true  # true: more CPU memory; false: more GPU memory
+      enable_cpu_offload: true  
       enable_rank0_init: true
     offload:
       offload_params: false

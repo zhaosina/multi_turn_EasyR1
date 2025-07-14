@@ -15,6 +15,9 @@
 import json
 import ray
 from omegaconf import OmegaConf
+import time
+import os
+import logging
 
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
@@ -34,6 +37,21 @@ class Runner:
     """A runner for RL training."""
 
     def run(self, config: PPOConfig):
+        log_dir = "/home/zhq/workdir/GUI/EasyR1/verl/trainer/train_log"
+        os.makedirs(log_dir, exist_ok=True)
+        
+        log_filename = f"mgrpo_v_run_{time.strftime('%Y%m%d-%H%M%S')}.log"
+        log_filepath = os.path.join(log_dir, log_filename)
+
+        # 配置此 Actor 的根记录器
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+            filename=log_filepath,
+            filemode='w',
+            force=True  # [关键] force=True 确保可以覆盖 Ray 可能设置的任何默认配置
+        )
         # 打印配置
         print("--- Training Configuration ---")
         print(json.dumps(config.to_dict(), indent=2))
@@ -125,6 +143,22 @@ class Runner:
 
 
 def main():
+    log_dir = "/home/zhq/workdir/GUI/EasyR1/verl/trainer/train_log"
+    os.makedirs(log_dir, exist_ok=True) # 确保日志目录存在
+    
+    # 创建一个基于当前时间的、独一无二的日志文件名
+    log_filename = f"mgrpo_v_run_{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log_filepath = os.path.join(log_dir, log_filename)
+
+    # 2. 配置 logging 模块
+    logging.basicConfig(
+        level=logging.INFO,  
+        format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        filename=log_filepath,
+        filemode='w'           
+    )
+
     # 从 CLI 和配置文件加载 PPOConfig
     cli_args       = OmegaConf.from_cli()
     default_config = OmegaConf.structured(PPOConfig())

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 from typing import Any, Dict, List
 
 import numpy as np
@@ -27,97 +26,84 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str, Any]:
     """Compute metrics related to the data in the batch."""
-    # This function is now updated to compute a more comprehensive set of metrics.
-    
-    # Check for the existence of keys before using them to maintain compatibility
-    if "token_level_scores" not in batch.batch or "token_level_rewards" not in batch.batch:
-        # Fallback for MGRPO-V or other flows that don't generate these scores
-        metrics = {}
-        if "advantages" in batch.batch:
-            advantages = batch.batch["advantages"]
-            metrics["critic/advantages_mean"] = advantages.mean().item()
-        if use_critic and "returns" in batch.batch:
-            returns = batch.batch["returns"]
-            metrics["critic/returns_mean"] = returns.mean().item()
+    metrics = {}
+
+    if "response_mask" not in batch.batch:
+        return {}
+
+    response_mask = batch.batch["response_mask"].bool()
+
+    # Path for MGRPO-V where advantages are computed at the trajectory level
+    if "token_level_rewards" not in batch.batch and "advantages" in batch.batch:
+        valid_adv = batch.batch["advantages"][response_mask]
+        metrics.update({
+            "critic/advantages_mean": valid_adv.mean().detach().item(),
+            "critic/advantages_max": valid_adv.max().detach().item(),
+            "critic/advantages_min": valid_adv.min().detach().item(),
+        })
         return metrics
 
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    if "token_level_scores" not in batch.batch:
+        return {} # Not enough data for full metrics
 
+    token_level_scores = batch.batch["token_level_scores"]
+    token_level_rewards = batch.batch["token_level_rewards"]
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
 
-    max_response_length = batch.batch["responses"].size(-1)
+    # Sequence-level metrics
+    metrics.update({
+        "critic/score_mean": (token_level_scores * response_mask).sum(dim=-1).mean().detach().item(),
+        "critic/reward_mean": (token_level_rewards * response_mask).sum(dim=-1).mean().detach().item(),
+    })
 
-    # Ensure attention_mask has the expected shape
-    if batch.batch["attention_mask"].dim() < 2 or batch.batch["attention_mask"].shape[1] < max_response_length:
-         # Handle cases where attention_mask might not be as expected
-        prompt_mask = torch.zeros_like(sequence_score) # Placeholder
-        response_mask = torch.ones_like(sequence_reward) # Assume all response tokens are valid if mask is malformed
-    else:
-        prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
-        response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
+    # Token-level metrics for advantage and return
+    valid_adv = advantages[response_mask]
+    valid_returns = returns[response_mask]
+    metrics.update({
+        "critic/advantages_mean": valid_adv.mean().detach().item(),
+        "critic/advantages_max": valid_adv.max().detach().item(),
+        "critic/advantages_min": valid_adv.min().detach().item(),
+        "critic/returns_mean": valid_returns.mean().detach().item(),
+        "critic/returns_max": valid_returns.max().detach().item(),
+        "critic/returns_min": valid_returns.min().detach().item(),
+    })
 
-    max_prompt_length = prompt_mask.size(-1)
-    prompt_length = prompt_mask.sum(-1).float()
-    response_length = response_mask.sum(-1).float()
-
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
-
-    if use_critic:
+    # Critic/Value-specific metrics
+    if use_critic and "values" in batch.batch:
         values = batch.batch["values"]
-        valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        valid_values = values[response_mask]
+        
+        # Explained variance
+        explained_var = 1 - torch.var(valid_returns - valid_values) / (torch.var(valid_returns) + 1e-8)
 
-    metrics = {
-        # score
-        "critic/score/mean": torch.mean(sequence_score).detach().item(),
-        "critic/score/max": torch.max(sequence_score).detach().item(),
-        "critic/score/min": torch.min(sequence_score).detach().item(),
-        # reward
-        "critic/rewards/mean": torch.mean(sequence_reward).detach().item(),
-        "critic/rewards/max": torch.max(sequence_reward).detach().item(),
-        "critic/rewards/min": torch.min(sequence_reward).detach().item(),
-        # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
-        # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
-        **(
-            {
-                # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
-                # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
-            }
-            if use_critic
-            else {}
-        ),
-        # response length
-        "response_length/mean": torch.mean(response_length).detach().item(),
-        "response_length/max": torch.max(response_length).detach().item(),
-        "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
-        .detach()
-        .item(),
-        # prompt length
-        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
-        "prompt_length/max": torch.max(prompt_length).detach().item(),
-        "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-    }
+        metrics.update({
+            "critic/values_mean": valid_values.mean().detach().item(),
+            "critic/values_max": valid_values.max().detach().item(),
+            "critic/values_min": valid_values.min().detach().item(),
+            "critic/vf_explained_var": explained_var.detach().item(),
+        })
+    
+    # Length metrics
+    if "attention_mask" in batch.batch:
+        attention_mask = batch.batch["attention_mask"].bool()
+        response_length = response_mask.sum(dim=-1).float()
+        # Prompt length is total length minus response length
+        prompt_length = attention_mask.sum(dim=-1).float() - response_length
+        
+        metrics.update({
+            "response_length/mean": response_length.mean().detach().item(),
+            "response_length/max": response_length.max().detach().item(),
+            "response_length/min": response_length.min().detach().item(),
+            "prompt_length/mean": prompt_length.mean().detach().item(),
+            "prompt_length/max": prompt_length.max().detach().item(),
+            "prompt_length/min": prompt_length.min().detach().item(),
+        })
+
     return metrics
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
-    # This function remains unchanged, but is included for completeness
     if "response_mask" not in batch.batch or "global_token_num" not in batch.meta_info:
         return {} # Not enough info to compute timing
 

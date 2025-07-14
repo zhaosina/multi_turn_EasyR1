@@ -76,35 +76,60 @@ def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
 
     return kl_ctrl
 
+def _extract_bbox_from_string(text: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    # 匹配 <box>(x1, y1), (x2, y2)</box> 格式
+    m = re.search(r'\((\d+),\s*(\d+)\),\s*\((\d+),\s*(\d+)\)', text)
+    if m:
+        x1, y1, x2, y2 = map(int, m.groups())
+        return ((x1, y1), (x2, y2))
+    raise ValueError("Bounding box format not found in string.")
+
+
 def _parse_absolute_coords_from_response(resp: str, img_w: int, img_h: int) -> List[int]:
 
     resp = resp.replace('<|im_end|>', '').strip()
-    
-    # 优先匹配最完整的格式
+    # 1. 优先匹配最完整、最明确的格式: [[x, y]]
     m = re.search(r'CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
-    if m: return [int(m.group(1)), int(m.group(2))]
+    if m:
+        return [int(m.group(1)), int(m.group(2))]
     
     m = re.search(r'actions?:\s*CLICK\s+<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
-    if m: return [int(m.group(1)), int(m.group(2))]
+    if m:
+        return [int(m.group(1)), int(m.group(2))]
     
     m = re.search(r'<point>\[\[(\d+),\s*(\d+)\]\]</point>', resp, flags=re.I)
-    if m: return [int(m.group(1)), int(m.group(2))]
-    
-    m = re.search(r'<points[^>]*x1\s*=\s*[\'"]?([\d.]+)[\'"]?[^>]*y1\s*=\s*[\'"]?([\d.]+)[\'"]?', resp, flags=re.I)
-    if m: return [int(float(m.group(1))), int(float(m.group(2)))]
+    if m:
+        return [int(m.group(1)), int(m.group(2))]
+    # 2. 匹配XML风格的格式，并使用 s? 来兼容 <point> 和 <points>
+    m = re.search(r'<points?[^>]*x1\s*=\s*[\'"]?([\d.]+)[\'"]?[^>]*y1\s*=\s*[\'"]?([\d.]+)[\'"]?', resp, flags=re.I)
+    if m:
+        return [int(float(m.group(1))), int(float(m.group(2)))]
 
+    # 3. 匹配包含浮点数的格式，并处理相对/绝对坐标转换
     m = re.search(r'<point>\[(\d+\.?\d*),\s*(\d+\.?\d*)\]</point>', resp, flags=re.I)
     if m:
         x, y = float(m.group(1)), float(m.group(2))
-        if x <= 1.0 and y <= 1.0: return [int(x * img_w), int(y * img_h)]
+        if x <= 1.0 and y <= 1.0:
+            return [int(x * img_w), int(y * img_h)]
         return [int(x), int(y)]
 
+    # 4. 匹配通用括号格式 ( ... ) or [ ... ]
     m = re.search(r'[\[\(]\s*([\d.]+)\s*,\s*([\d.]+)\s*[\]\)]', resp)
     if m:
         x, y = float(m.group(1)), float(m.group(2))
-        if x <= 1.0 and y <= 1.0: return [int(x * img_w), int(y * img_h)]
+        if x <= 1.0 and y <= 1.0:
+            return [int(x * img_w), int(y * img_h)]
         return [int(x), int(y)]
-    
+
+    # 5. 如果包含 'box' 关键字，尝试解析bounding box并计算中心点作为后备方案
+    if 'box' in resp.lower():
+        try:
+            b = _extract_bbox_from_string(resp)
+            center_x = (b[0][0] + b[1][0]) / 2
+            center_y = (b[0][1] + b[1][1]) / 2
+            return [int(center_x), int(center_y)]
+        except ValueError:
+            pass
     raise ValueError("no_coord_found_in_response")
 
 def _check_hit_absolute(pred_abs: List[int], gt_bbox_xywh: List[float]) -> bool:
@@ -131,9 +156,7 @@ def _calculate_distance(point1: List[float], point2: List[float]) -> float:
 
 
 def _score_trajectory(trajectory_coords: List[List[int]], gt_bbox_xywh: List[float], img_dims: List[int]) -> Dict[str, float]:
-    """
-    对一条完整的轨迹进行评分，返回一个包含各项得分的字典。
-    """
+
     if not trajectory_coords:
         # 如果轨迹无效，返回一个包含惩罚分数的字典
         return {
@@ -146,15 +169,15 @@ def _score_trajectory(trajectory_coords: List[List[int]], gt_bbox_xywh: List[flo
     gt_x, gt_y, gt_w, gt_h = gt_bbox_xywh
     target_center = [gt_x + gt_w / 2, gt_y + gt_h / 2]
     
-    # 1. 准确度得分 (Accuracy Score)
+    # 1. 准确度得分
     final_prediction = trajectory_coords[-1]
     final_distance = _calculate_distance(final_prediction, target_center)
     accuracy_score = np.exp(-final_distance / 50.0)
 
-    # 2. 效率得分 (Efficiency Score)
+    # 2. 效率得分 
     efficiency_score = 1.0 / len(trajectory_coords)
 
-    # 3. 平滑度得分 (Smoothness Score)
+    # 3. 平滑度得分
     smoothness = 0
     if len(trajectory_coords) > 2:
         for i in range(2, len(trajectory_coords)):
@@ -174,6 +197,19 @@ def _score_trajectory(trajectory_coords: List[List[int]], gt_bbox_xywh: List[flo
         "smoothness": smoothness_score,
     }
 
+
+def _calculate_format_reward(response: str) -> float:
+    """对输出的格式进行评分"""
+    reward = 0.0
+    if not isinstance(response, str):
+        return reward
+        
+    if "CLICK" in response: reward += 0.1
+    if "<point>" in response: reward += 0.1
+    if "</point>" in response: reward += 0.1
+    if "[[" in response and "]]" in response: reward += 0.2
+    return reward
+    
 @torch.no_grad()
 def compute_mgrpo_v_advantage(
     decoded_responses: np.ndarray,
@@ -182,22 +218,24 @@ def compute_mgrpo_v_advantage(
     response_mask: torch.Tensor,
     trajectory_ids: torch.Tensor,
     turn_ids: torch.Tensor,
+    n_rollouts: int,
     eps: float = 1e-8,
     w_outcome: float = 1.0,
     w_prog: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+
     batch_size = response_mask.shape[0]
     device = response_mask.device
     
     trajectories_indices = defaultdict(list)
-    # --- 1. 按轨迹ID分组 ---
-    # 这里的 trajectory_id 是我们在预处理时为每个初始 prompt 分配的唯一ID
-    # 在 _make_batch_data 中，这个ID被乘以K并加上k，为每个生成的轨迹创建了新的唯一ID
+    # --- 1. 按 "原始任务ID" 进行分组 ---
     for i in range(batch_size):
-        # 我们需要按初始 prompt 分组，所以用 trajectory_id // K (假设K是rollout.n)
-        trajectories_indices[trajectory_ids[i].item()].append(i)
+        original_group_id = trajectory_ids[i].item() // n_rollouts
+        trajectories_indices[original_group_id].append(i)
 
-    advantages = torch.zeros(batch_size, device=device)
+    advantages = torch.zeros_like(response_mask, dtype=torch.float32)
+    returns = torch.zeros_like(response_mask, dtype=torch.float32)
+    
     log_counter = 0
     log_limit = 3  # 只打印每个批次中前3个轨迹组的详细日志
 
@@ -206,72 +244,78 @@ def compute_mgrpo_v_advantage(
         
         should_log = log_counter < log_limit
         if should_log:
-            logging.warning(f"\n--- [DEBUG] Processing Trajectory Group ID: {group_id} ---")
+            logging.warning(f"\n--- [MGRPO-V DEBUG] START Group ID: {group_id} ---")
 
         group_scores = []
-        
-        # --- 2a. 评分：为组内的每个轨迹计算得分 ---
-        # group_indices 现在包含一个轨迹的所有steps的索引
-        # 我们需要再次按轨迹ID细分
         sub_trajectories = defaultdict(list)
         for idx in group_indices:
             sub_trajectories[trajectory_ids[idx].item()].append(idx)
 
+        # 对组内的每个完整轨迹进行评分
         for traj_id_in_group, step_indices in sub_trajectories.items():
             
-            # 按轮次排序
             sorted_step_indices = sorted(step_indices, key=lambda i: turn_ids[i].item())
-            
-            # 解析坐标
             coords_list = []
             img_w, img_h = image_dims[sorted_step_indices[0]].tolist()
             
             if should_log:
-                logging.warning(f"  - Trajectory {traj_id_in_group}:")
-
+                logging.warning(f"  - Trajectory ID: {traj_id_in_group}")
             for step_idx in sorted_step_indices:
                 resp = decoded_responses[step_idx]
                 try:
                     coords = _parse_absolute_coords_from_response(resp, img_w, img_h)
                     coords_list.append(coords)
                     if should_log:
-                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: Parsed {coords} from '{resp.strip()}'")
+                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: RAW='{resp.strip()}' -> PARSED={coords}")
                 except ValueError:
                     if should_log:
-                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: Parsing FAILED for '{resp.strip()}'")
+                        logging.warning(f"    - Turn {turn_ids[step_idx].item()}: RAW='{resp.strip()}' -> PARSING FAILED")
                     coords_list = []
                     break
             
-            # 计算轨迹得分
             gt_bbox = gt_bboxes_xywh[sorted_step_indices[0]].tolist()
             score_dict = _score_trajectory(coords_list, gt_bbox, [img_w, img_h])
-            group_scores.append(score_dict["total"])
+            final_response = decoded_responses[sorted_step_indices[-1]] if sorted_step_indices else ""
+            format_reward = _calculate_format_reward(final_response)
+            total_score = w_outcome * score_dict["total"] + w_prog * format_reward
+            group_scores.append(total_score)
             
             if should_log:
-                logging.warning(f"    -> Trajectory Score: {score_dict['total']:.3f} (Acc: {score_dict['accuracy']:.2f}, Eff: {score_dict['efficiency']:.2f}, Smooth: {score_dict['smoothness']:.2f})")
+                # [日志] 打印轨迹的最终评分
+                logging.warning(f"    -> SCORES: [Total: {score_dict['total']:.3f}, Acc: {score_dict['accuracy']:.2f}, Eff: {score_dict['efficiency']:.2f}, Smooth: {score_dict['smoothness']:.2f}]")
+                logging.warning(f"    -> FORMAT_REWARD: {format_reward:.2f}")
+                logging.warning(f"    -> FINAL_WEIGHTED_SCORE: {total_score:.3f}")
 
-        # --- 2b. GRPO优势计算 ---
-        if not group_scores: continue
+        # GRPO优势计算
+        if not group_scores or len(group_scores) <= 1: 
+            continue
+            
         scores_tensor = torch.tensor(group_scores, device=device)
         mean_score = scores_tensor.mean()
-        std_score = scores_tensor.std()
-        traj_advantages = (scores_tensor - mean_score) / (std_score + eps)
+        std_score = scores_tensor.std(unbiased=False)
 
-        # --- 2c. 广播优势 ---
+        if std_score < eps:
+            traj_advantages = torch.zeros_like(scores_tensor)
+        else:
+            traj_advantages = (scores_tensor - mean_score) / (std_score + eps)
+        
+        # 广播优势
         for i, traj_id_in_group in enumerate(sub_trajectories.keys()):
-            traj_advantage = traj_advantages[i]
-            advantages[trajectory_ids == traj_id_in_group] = traj_advantage
+            indices_for_this_traj = (trajectory_ids == traj_id_in_group)
+            advantages[indices_for_this_traj] = traj_advantages[i]
         
         if should_log:
+            # [日志] 打印整个组的优势计算结果
+            logging.warning(f"  - Group Final Scores: {[f'{s:.3f}' for s in group_scores]}")
             logging.warning(f"  - Group Advantage Stats: Mean={mean_score:.3f}, Std={std_score:.3f}")
-            logging.warning(f"--- [DEBUG] End Group ID: {group_id} ---\n")
+            logging.warning(f"  - Calculated Advantages: {[f'{adv:.3f}' for adv in traj_advantages]}")
+            logging.warning(f"--- [MGRPO-V DEBUG] END Group ID: {group_id} ---\n")
             log_counter += 1
             
-    advantages = advantages.unsqueeze(-1) * response_mask
+    advantages = advantages * response_mask
     returns = advantages.clone()
 
     return advantages, returns
-
 
 @torch.no_grad()
 def compute_gae_advantage_return(

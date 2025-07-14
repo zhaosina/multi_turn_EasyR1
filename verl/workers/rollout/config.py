@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 class RolloutConfig:
     name: str = "vllm"
     n: int = 1
+    do_sample:bool = True
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1

@@ -62,6 +62,63 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from .config import DataConfig
 
+def resize_and_transform_bbox(
+    img: Image.Image, 
+    bbox_xywh: List[float], 
+    target_size: tuple, 
+    fill_color: tuple = (128, 128, 128)
+) -> Tuple[Image.Image, List[float]]:
+    """
+    Resizes an image to a target size while maintaining aspect ratio,
+    and transforms the bounding box coordinates accordingly.
+
+    :param img: The input PIL Image.
+    :param bbox_xywh: The ground-truth bounding box in [x, y, w, h] format.
+    :param target_size: A tuple (width, height) for the output image.
+    :param fill_color: The color for the padding. Default is gray.
+    :return: A tuple containing the resized/padded PIL Image and the transformed bbox 
+             in [x', y', w', h'] format.
+    """
+    # 原始图像尺寸 (W, H)
+    original_w, original_h = img.size
+    # 目标尺寸 (Tw, Th)
+    target_w, target_h = target_size
+
+    # 1. 计算缩放比 r
+    ratio = min(target_w / original_w, target_h / original_h)
+    
+    # 计算缩放后的新尺寸 (rW, rH)
+    new_w = int(original_w * ratio)
+    new_h = int(original_h * ratio)
+    
+    img_resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # 创建一个目标尺寸的灰色背景画布
+    new_img = Image.new("RGB", target_size, fill_color)
+    
+    # 2. 计算填充偏移 (px, py)
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    
+    new_img.paste(img_resized, (paste_x, paste_y))
+    
+    # 3. 对 bounding box 进行坐标变换
+    original_x, original_y, original_box_w, original_box_h = bbox_xywh
+    
+    # 应用您提供的公式
+    # x' = x*r + px
+    # y' = y*r + py
+    # w' = w*r
+    # h' = h*r
+    transformed_x = original_x * ratio + paste_x
+    transformed_y = original_y * ratio + paste_y
+    transformed_w = original_box_w * ratio
+    transformed_h = original_box_h * ratio
+    
+    transformed_bbox_xywh = [transformed_x, transformed_y, transformed_w, transformed_h]
+    
+    return new_img, transformed_bbox_xywh
+
 
 class MGRPODataset(Dataset):
     def __init__(
@@ -104,69 +161,88 @@ class MGRPODataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """
-        Retrieves a single data sample and resizes the image.
-        """
         item = self.data[idx]
-
         image_path = os.path.join(self.image_dir, item[self.image_key])
         try:
             image = Image.open(image_path).convert("RGB")
-            # Resize image to ensure all pixel_values tensors have the same shape
-            image = image.resize(self.image_size)
-            img_w, img_h = image.size
         except Exception as e:
-            logging.error(f"Could not load or resize image {image_path}: {e}")
-            return {} 
+            logging.error(f"Could not load image {image_path}: {e}")
+            return None # Return None to be filtered out in collate_fn
 
-        prompt_text = item[self.prompt_key]
+        # Get original bbox without transformation
         gt_bbox_xywh = item.get(self.gt_bbox_key)
+        
         trajectory_id = item.get(self.traj_id_key)
         turn_id = item.get(self.turn_id_key)
 
         if gt_bbox_xywh is None or trajectory_id is None or turn_id is None:
             logging.error(f"Missing required MGRPO-V metadata in item {idx}.")
-            return {}
+            return None
 
         return {
-            "image": image,
-            "prompt": prompt_text,
-            "gt_bboxes_xywh": torch.tensor(gt_bbox_xywh, dtype=torch.float32),
-            "image_dims": torch.tensor([img_w, img_h], dtype=torch.int32),
-            "trajectory_ids": torch.tensor(trajectory_id, dtype=torch.long),
-            "turn_ids": torch.tensor(turn_id, dtype=torch.long),
+            "image": image,  # The original, variable-sized PIL Image
+            "prompt": item[self.prompt_key],
+            "gt_bboxes_xywh": gt_bbox_xywh, # The original bbox
+            "trajectory_ids": trajectory_id,
+            "turn_ids": turn_id,
         }
-
 
 def mgrpo_v_collate_fn(
     batch: List[Dict[str, Any]],
     *,
     processor: ProcessorMixin,
     tokenizer: PreTrainedTokenizer,
+    patch_size: int = 14 # Patch size for the Vision Transformer
 ) -> Dict[str, Any]:
     """
-    [最终版] 采用循环方式逐个处理样本，并集成Tensor方案以支持迭代纠错。
+    [REWRITTEN] This version implements dynamic padding within each batch.
+    It finds the max dimensions in the current batch, pads all images to that
+    size, transforms bboxes, and then collates everything.
     """
-    # 安全检查：过滤掉 prompt 为空或无效的样本
-    batch = [b for b in batch if b and b.get("prompt")]
+    batch = [b for b in batch if b is not None]
     if not batch:
         return {}
     batch_size = len(batch)
 
-    # 1. 在循环中逐个处理样本 (遵循您的要求)
+    # --- Step A: Find the maximum dimensions in the current batch ---
+    max_w, max_h = 0, 0
+    for sample in batch:
+        w, h = sample["image"].size
+        if w > max_w: max_w = w
+        if h > max_h: max_h = h
+    
+    # --- Step B: Align dimensions to be divisible by the patch size ---
+    target_w = (max_w + patch_size - 1) // patch_size * patch_size
+    target_h = (max_h + patch_size - 1) // patch_size * patch_size
+    target_size = (target_w, target_h)
+    
+    # --- Step C: Loop through samples, apply padding, and process ---
     proc_outs = []
-    for b in batch:
-        # 注意：此处不进行 padding，padding 在后续步骤中对整个批次进行
+    transformed_bboxes_list = []
+    padded_images_for_opv = []
+
+    for sample in batch:
+        # Pad the image to the dynamic target size and transform its bbox
+        padded_image, transformed_bbox = resize_and_transform_bbox(
+            sample["image"], sample["gt_bboxes_xywh"], target_size
+        )
+        
+        # Process the now-padded image with its corresponding text
         proc_out = processor(
-            text=[b["prompt"]],
-            images=[b["image"]],
+            text=[sample["prompt"]],
+            images=[padded_image],
             truncation=True,
             max_length=tokenizer.model_max_length,
             return_tensors="pt",
         )
         proc_outs.append(proc_out)
+        transformed_bboxes_list.append(torch.tensor(transformed_bbox, dtype=torch.float32))
+        padded_images_for_opv.append(padded_image)
+        
+    # --- Step D: Collate all processed data into final tensors ---
+    # (This logic is mostly the same as before, but now operates on dynamically sized data)
 
-    # 2. 手动对文本进行批处理和填充
+    # Collate text
     ids_list  = [o.input_ids[0] for o in proc_outs]
     mask_list = [o.attention_mask[0] for o in proc_outs]
     text_padded = tokenizer.pad(
@@ -176,49 +252,41 @@ def mgrpo_v_collate_fn(
     )
     B, L = text_padded["input_ids"].shape
 
-    # 3. 手动对图像特征进行批处理和重塑
+    # Collate image features
     pv_list = [o["pixel_values"] for o in proc_outs]
     pixel_values_flat = torch.cat(pv_list, dim=0)
     
-    # [必要修复] 重塑 pixel_values 以匹配正确的批处理形状 [B, Num_Patches, Dim]
-    if pixel_values_flat.dim() == 2 and pixel_values_flat.shape[0] != batch_size:
-        assert pixel_values_flat.shape[0] % batch_size == 0
-        pixel_values = pixel_values_flat.view(batch_size, -1, pixel_values_flat.shape[-1])
-    else:
+    if pixel_values_flat.dim() > 2: # Handle different processor outputs
         pixel_values = pixel_values_flat
+    else:
+        pixel_values = pixel_values_flat.view(batch_size, -1, pixel_values_flat.shape[-1])
 
-    # 4. [Tensor方案核心] 将原始图像转换为uint8张量
-    pil_images = [b["image"] for b in batch]
+    # Collate original pixel values (which are now padded)
     original_pixel_values = torch.stack(
-        [T.PILToTensor()(img) for img in pil_images]
-    ).permute(0, 2, 3, 1) # 从 [B,C,H,W] 转为 [B,H,W,C]
+        [T.PILToTensor()(img) for img in padded_images_for_opv]
+    ).permute(0, 2, 3, 1)
 
-    # 5. 创建其他Tensors
+    # Create other tensors
     position_ids = torch.arange(L, dtype=torch.long, device=text_padded["input_ids"].device).unsqueeze(0).repeat(B, 1)
     raw_prompt_ids = [tokenizer.encode(b["prompt"], add_special_tokens=False) for b in batch]
     
-    # 6. 组装最终字典
+    # Assemble the final dictionary
     out = {
-        # Tensors
         "input_ids":             text_padded["input_ids"],
         "attention_mask":        text_padded["attention_mask"],
         "position_ids":          position_ids,
         "pixel_values":          pixel_values,
-        "original_pixel_values": original_pixel_values, # <-- 使用Tensor存储原始图像
-        "gt_bboxes_xywh":        torch.stack([b["gt_bboxes_xywh"] for b in batch]),
-        "image_dims":            torch.stack([b["image_dims"] for b in batch]),
-        "trajectory_ids":        torch.stack([b["trajectory_ids"] for b in batch]),
-        "turn_ids":              torch.stack([b["turn_ids"] for b in batch]),
-        # Non-Tensor
+        "original_pixel_values": original_pixel_values, 
+        "gt_bboxes_xywh":        torch.stack(transformed_bboxes_list),
+        "image_dims":            torch.tensor([list(target_size)] * B, dtype=torch.int32),
+        "trajectory_ids":        torch.tensor([b["trajectory_ids"] for b in batch], dtype=torch.long),
+        "turn_ids":              torch.tensor([b["turn_ids"] for b in batch], dtype=torch.long),
         "original_prompts":      np.array([b["prompt"] for b in batch], dtype=object),
         "raw_prompt_ids":        np.array(raw_prompt_ids, dtype=object),
     }
-
-    thw_list = [o.get("image_grid_thw") for o in proc_outs if o.get("image_grid_thw") is not None]
-    if thw_list:
-        out["image_grid_thw"] = torch.cat(thw_list, dim=0)
-
+    
     return out
+
 
 def create_mgrpo_v_dataloader(config: DataConfig, tokenizer: PreTrainedTokenizer, processor: Optional[ProcessorMixin]) -> tuple:
     """

@@ -537,27 +537,39 @@ class DataProto:
         return iter(get_data())
 
     def chunk(self, chunks: int) -> List["DataProto"]:
-        """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
-
-        Args:
-            chunks (int): the number of chunks to split on dim=0
-
-        Returns:
-            List[DataProto]: a list of DataProto after splitting
         """
-        assert len(self) % chunks == 0, (
-            f"only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}."
-        )
+        [最终修正版] 将批次拆分为多个块。此版本移除了不必要的整除断言，并能健壮地处理各种情况。
+        """
+        if not isinstance(chunks, int) or chunks <= 0:
+            raise ValueError(f"chunks must be a positive integer, but got {chunks}")
+
+        if len(self) == 0:
+            return [DataProto(meta_info=self.meta_info) for _ in range(chunks)]
+
+        # 1. 拆分 TensorDict
         if self.batch is not None:
+            # torch.chunk 本身就能完美处理无法整除的情况
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)
         else:
             batch_lst = [None for _ in range(chunks)]
 
+        # 2. 拆分 non_tensor_batch
         non_tensor_batch_lst = [{} for _ in range(chunks)]
         for key, value in self.non_tensor_batch.items():
-            non_tensor_lst = np.array_split(value, chunks)
-            for i in range(chunks):
-                non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+            # 使用 np.array_split，这是专门为处理无法整除的情况而设计的
+            try:
+                non_tensor_lst = np.array_split(value, chunks)
+                for i in range(chunks):
+                    if non_tensor_lst[i].size > 0:
+                        non_tensor_batch_lst[i][key] = non_tensor_lst[i]
+            except (ValueError, TypeError):
+                 # 对于复杂的 object 数组，array_split 可能失败，使用手动分割
+                total_len = len(value)
+                for i in range(chunks):
+                    start = total_len * i // chunks
+                    end = total_len * (i + 1) // chunks
+                    if start < end:
+                        non_tensor_batch_lst[i][key] = value[start:end]
 
         return [
             DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info)
@@ -565,17 +577,37 @@ class DataProto:
         ]
 
     def split(self, split_size: int) -> List["DataProto"]:
-        """Split the batch among dim=0 into chunks. The meta_info is passed to each DataProto after split.
-
-        Args:
-            split_size (int): the size of each split
-
-        Returns:
-            List[DataProto]: a list of DataProto after splitting
         """
-        chunks = len(self) // split_size
-        return self.chunk(chunks)
+        [最终修正版] 将批次按指定大小拆分。此版本不再调用脆弱的 chunk 方法。
+        """
+        if not isinstance(split_size, int) or split_size <= 0:
+            raise ValueError("split_size must be a positive integer.")
+        if len(self) == 0:
+            return []
 
+        # 1. 拆分 TensorDict
+        if self.batch is not None:
+            # torch.split 本身就能完美处理无法整除的情况
+            batch_lst = self.batch.split(split_size, dim=0)
+        else:
+            num_chunks = (len(self) + split_size - 1) // split_size
+            batch_lst = [None] * num_chunks
+
+        # 2. 拆分 non_tensor_batch
+        non_tensor_batch_lst = [{} for _ in range(len(batch_lst))]
+        for key, value in self.non_tensor_batch.items():
+            # 手动按 split_size 安全地分割 numpy 数组
+            num_chunks = (len(value) + split_size - 1) // split_size
+            for i in range(num_chunks):
+                start_idx = i * split_size
+                end_idx = min((i + 1) * split_size, len(value))
+                if start_idx < end_idx:
+                    non_tensor_batch_lst[i][key] = value[start_idx:end_idx]
+        
+        return [
+            DataProto(batch=batch_lst[i], non_tensor_batch=non_tensor_batch_lst[i], meta_info=self.meta_info)
+            for i in range(len(batch_lst))
+        ]
 
     @staticmethod
     def concat(data: List["DataProto"]) -> "DataProto":

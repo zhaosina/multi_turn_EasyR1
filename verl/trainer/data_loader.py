@@ -240,9 +240,7 @@ def mgrpo_v_collate_fn(
         padded_images_for_opv.append(padded_image)
         
     # --- Step D: Collate all processed data into final tensors ---
-    # (This logic is mostly the same as before, but now operates on dynamically sized data)
-
-    # Collate text
+   
     ids_list  = [o.input_ids[0] for o in proc_outs]
     mask_list = [o.attention_mask[0] for o in proc_outs]
     text_padded = tokenizer.pad(
